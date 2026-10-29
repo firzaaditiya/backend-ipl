@@ -66,6 +66,8 @@ On Windows PowerShell, use `$env:FIM_*` equivalents. Do not commit
 | `FIM_TELEGRAM_CHAT_ID` | Telegram destination |
 | `FIM_ALLOWED_ORIGINS` | Comma-separated CORS origins |
 | `FIM_STRICT_SECRETS` | Set to `1` to fail startup for weak JWT secrets |
+| `FIM_REQUIRE_EXTERNAL_SECRETS` | Reject credentials in `config.json` when set to `1` |
+| `FIM_REQUIRE_LOCAL_API` | Reject non-local API binding when set to `1` |
 
 ## API Overview
 
@@ -107,7 +109,7 @@ FIM_TELEGRAM_CHAT_ID=replace-with-a-chat-id
 
 If the web application and the FIM daemon run as the same OS user, a web
 compromise can read the daemon's secrets and ledger. Separate OS identities
-are therefore a security requirement, not an optional optimization.
+are therefore required, not an optional optimization.
 
 ### Web compromise threat model
 
@@ -126,15 +128,43 @@ permissions. The deployment boundary must therefore be:
 - `ProtectProc=invisible`, `NoNewPrivileges`, and the dedicated systemd user
   reduce process/environment inspection and privilege escalation.
 
-If the attacker becomes `root`, or compromises the FIM service user itself,
-the host is already outside the protection boundary. Use host hardening,
-EDR, egress controls, off-host ledger backups, and rapid secret rotation for
-that case. Renaming or hiding a file does not solve a root-level compromise.
+The protection boundary is explicit:
+
+- **Web user compromised (`www-data`):** the attacker can change monitored
+  files, but must not be able to read `/etc/fim-ipl/fim.env`, `/opt/fim-ipl/data`,
+  or the FIM process environment. The daemon should continue as `fim-ipl` and
+  record the changed files.
+- **FIM user compromised:** the attacker may access the daemon's data and
+  secrets. Revoke JWT/Telegram credentials, stop the service, preserve the
+  ledger backup, and rebuild the host.
+- **Root compromised:** the attacker can read or modify every local file and
+  process. This application cannot provide a trustworthy local security
+  boundary in that situation. Recovery requires host rebuild, credential
+  rotation, firewall/egress review, EDR or other host telemetry, and an
+  off-host ledger copy.
+
+Hiding or renaming `config.json` is not a security control. File permissions,
+separate OS identities, external secrets, localhost binding, and off-host
+backups are the controls used by this deployment.
 
 ## Verification
 
 ```bash
+gofmt -w .
+go build ./...
+go vet ./...
+go test ./...
+go test -race ./...
 ```
 
-The race detector requires a native Linux toolchain with CGO and GCC. The
-official Windows functional demo is documented in `../SIDANG_WINDOWS.md`.
+`go test -race` requires a native Linux toolchain with CGO and GCC. A Windows
+functional check can be run directly from this repository with:
+
+```powershell
+$env:FIM_CONFIG_PATH = "C:\path\to\config.json"
+go run ./cmd/server
+```
+
+The complete thesis demo launcher is part of the local monorepo, not this
+standalone repository: `D:\SKRIPSI\software\dev.ps1` and
+`D:\SKRIPSI\software\SIDANG_WINDOWS.md`.
