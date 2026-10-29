@@ -1,0 +1,23 @@
+# Local configuration and credentials
+data/*.json
+!data/config.example.json
+data/*.db
+data/*.db-*
+data/*.bak*
+
+# Local binaries, logs, and runtime state
+*.exe
+*.out
+*.log
+.run/
+
+# Coverage and test artifacts
+coverage.out
+coverage.html
+*.test
+
+# IDE / OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

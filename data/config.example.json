@@ -1,0 +1,19 @@
+{
+  "server_port": ":8080",
+  "jwt_secret": "",
+  "login_path": "/api/v1/secure-gate",
+  "admin_username": "admin",
+  "admin_password": "",
+  "auditor_username": "",
+  "auditor_password": "",
+  "watch_paths": [
+    "/var/www/html"
+  ],
+  "scan_interval_sec": 120,
+  "worker_count": 4,
+  "telegram_token": "",
+  "telegram_chat_id": "",
+  "backup_webhook_url": "",
+  "allowed_origins": [],
+  "db_path": "./data/fim.db"
+}
