@@ -184,6 +184,17 @@ func (h *SettingsHandler) StartMonitoring(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Status monitoring DIPERTAHANKAN di config.json SEBELUM scanner
+	// dijalankan: bila proses mati/restart, daemon tahu monitoring harus
+	// dilanjutkan otomatis (lihat main.go). Gagal persist = jangan mulai,
+	// agar status di disk tidak berbohong.
+	h.cfg.Update(func(c *config.Config) { c.MonitoringEnabled = true })
+	if err := h.cfg.Persist(); err != nil {
+		log.Printf("[Settings] Failed to persist monitoring state: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save monitoring state"})
+		return
+	}
+
 	h.scanner.StartMonitoring(h.cfg.GetScanInterval())
 	log.Println("[Settings] Monitoring started")
 	publishState(h.hub, h.scanner, "monitoring_started")
@@ -199,6 +210,17 @@ func (h *SettingsHandler) StopMonitoring(w http.ResponseWriter, r *http.Request)
 
 	if !h.scanner.IsRunning() {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "monitoring not running"})
+		return
+	}
+
+	// Sama seperti Start: status di disk diubah dulu, baru scanner
+	// dihentikan. Restart proses TIDAK memanggil handler ini, jadi flag
+	// tidak ikut terhapus saat systemctl restart — itulah yang membuat
+	// auto-resume di main.go bekerja.
+	h.cfg.Update(func(c *config.Config) { c.MonitoringEnabled = false })
+	if err := h.cfg.Persist(); err != nil {
+		log.Printf("[Settings] Failed to persist monitoring state: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save monitoring state"})
 		return
 	}
 

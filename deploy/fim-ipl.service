@@ -11,6 +11,12 @@ WorkingDirectory=/opt/fim-ipl
 Environment=FIM_CONFIG_PATH=/opt/fim-ipl/data/config.json
 EnvironmentFile=-/etc/fim-ipl/fim.env
 Environment=FIM_STRICT_SECRETS=1
+# FIM_REQUIRE_EXTERNAL_SECRETS=1 hanya untuk deployment yang mengelola
+# SEMUA kredensial lewat environment/secret manager dan TIDAK memakai
+# Settings API untuk Telegram/Auditor (API itu menulis ke config.json).
+# Bila Settings API dipakai untuk kredensial, flag ini membuat boot gagal
+# by design. Deployment produksi TPQ Al-Fawwaz memakai Settings API, jadi
+# flag ini dimatikan di unit produksi (bukan di template ini).
 Environment=FIM_REQUIRE_EXTERNAL_SECRETS=1
 Environment=FIM_REQUIRE_LOCAL_API=1
 Environment=FIM_SERVER_PORT=127.0.0.1:8080
@@ -24,7 +30,16 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/fim-ipl/data
+# Karantina (chmod) pada file milik user web membutuhkan CAP_FOWNER, dan
+# ProtectSystem=strict me-mount seluruh filesystem read-only kecuali
+# ReadWritePaths. Tanpa ReadWritePaths untuk watch path, karantina gagal
+# dengan "read-only file system" (bug yang ditemukan saat simulasi
+# 2026-10-29). Sesuaikan SupplementaryGroups dengan grup user web server
+# (di Ubuntu + WordPress: www-data) dan tambahkan setiap watch path ke
+# ReadWritePaths. Direktori watch path tetap 755 sehingga daemon tidak bisa
+# membuat/menghapus file di sana — hanya chmod yang diizinkan capability.
+ReadWritePaths=/opt/fim-ipl/data /var/www/html
+SupplementaryGroups=www-data
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -36,8 +51,8 @@ RestrictNamespaces=true
 RestrictRealtime=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-CapabilityBoundingSet=
-AmbientCapabilities=
+CapabilityBoundingSet=CAP_FOWNER
+AmbientCapabilities=CAP_FOWNER
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 

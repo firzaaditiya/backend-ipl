@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -21,6 +22,19 @@ type Config struct {
 	JWTSecret  string `json:"jwt_secret"`
 	LoginPath  string `json:"login_path"`
 
+	// CookieSecure mengaktifkan atribut Secure pada cookie sesi. Default
+	// true (aman): cookie hanya dikirim lewat HTTPS. Nonaktifkan hanya
+	// untuk dev HTTP lokal lewat FIM_COOKIE_SECURE=0.
+	CookieSecure bool `json:"cookie_secure"`
+
+	// MonitoringEnabled adalah status monitoring yang DIPERTAHANKAN di
+	// config.json (bukan rahasia deployment). True berarti monitoring
+	// sedang berjalan saat terakhir diubah lewat API, sehingga daemon
+	// melanjutkannya otomatis setelah restart. Berbeda dengan shutdown
+	// proses (systemctl restart) yang TIDAK mengubah flag ini: restart
+	// tidak dianggap sebagai perintah stop oleh admin.
+	MonitoringEnabled bool `json:"monitoring_enabled"`
+
 	AdminUsername string `json:"admin_username"`
 	AdminPassword string `json:"admin_password"`
 
@@ -38,9 +52,12 @@ type Config struct {
 
 	BackupWebhookURL string `json:"backup_webhook_url"`
 
-	// AllowedOrigins membatasi CORS. Kosong = izinkan semua origin (perilaku
-	// lama, aman karena auth memakai bearer token, bukan cookie). Isi daftar
-	// origin (mis. http://localhost:3000) untuk membatasinya.
+	// AllowedOrigins membatasi CORS sekaligus menjadi daftar origin yang
+	// diizinkan pada pemeriksaan CSRF untuk request mutasi. Kosong =
+	// izinkan semua origin (perilaku lama, TIDAK disarankan bila auth
+	// sudah memakai cookie, karena pemeriksaan Origin ikut dinonaktifkan).
+	// Produksi wajib mengisinya dengan origin dashboard, mis.
+	// https://fim.tpqalfawwaz.web.id.
 	AllowedOrigins []string `json:"allowed_origins"`
 
 	DBPath string `json:"db_path"`
@@ -53,17 +70,19 @@ var (
 
 func DefaultConfig() *Config {
 	return &Config{
-		ServerPort:      ":8080",
-		JWTSecret:       "",
-		LoginPath:       "/api/v1/secure-gate",
-		AdminUsername:   "",
-		AdminPassword:   "",
-		WatchPaths:      []string{},
-		ScanIntervalSec: 300,
-		WorkerCount:     4,
-		TelegramToken:   "",
-		TelegramChatID:  "",
-		DBPath:          "./data/fim.db",
+		ServerPort:        ":8080",
+		JWTSecret:         "",
+		LoginPath:         "/api/v1/secure-gate",
+		CookieSecure:      true,
+		MonitoringEnabled: false,
+		AdminUsername:     "",
+		AdminPassword:     "",
+		WatchPaths:        []string{},
+		ScanIntervalSec:   300,
+		WorkerCount:       4,
+		TelegramToken:     "",
+		TelegramChatID:    "",
+		DBPath:            "./data/fim.db",
 	}
 }
 
@@ -112,6 +131,13 @@ func Load(path string) (*Config, error) {
 			instance.JWTSecret = generateRandomSecret()
 			changed = true
 		}
+		// Migrasi cookie_secure: config yang dibuat sebelum v1.1.0 tidak
+		// punya kunci ini (nol value = false). Karena default yang aman
+		// adalah true, kunci yang hilang dianggap true, bukan false.
+		if !bytes.Contains(data, []byte(`"cookie_secure"`)) {
+			instance.CookieSecure = true
+			changed = true
+		}
 		if changed {
 			_ = Save(path, instance)
 		}
@@ -140,11 +166,22 @@ func Load(path string) (*Config, error) {
 //	FIM_ADMIN_USERNAME, FIM_ADMIN_PASSWORD,
 //	FIM_AUDITOR_USERNAME, FIM_AUDITOR_PASSWORD,
 //	FIM_TELEGRAM_TOKEN, FIM_TELEGRAM_CHAT_ID,
-//	FIM_ALLOWED_ORIGINS (dipisah koma)
+//	FIM_ALLOWED_ORIGINS (dipisah koma),
+//	FIM_COOKIE_SECURE ("1"/"true" atau "0"/"false")
 func applyEnvOverrides(c *Config) {
 	if v := os.Getenv("FIM_SERVER_PORT"); v != "" {
 		c.ServerPort = v
 		markEnv(c, "server_port")
+	}
+	if v := os.Getenv("FIM_COOKIE_SECURE"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true":
+			c.CookieSecure = true
+			markEnv(c, "cookie_secure")
+		case "0", "false":
+			c.CookieSecure = false
+			markEnv(c, "cookie_secure")
+		}
 	}
 	if v := os.Getenv("FIM_JWT_SECRET"); v != "" {
 		c.JWTSecret = v
@@ -331,21 +368,23 @@ func (c *Config) IsAdminConfigured() bool {
 // Snapshot adalah salinan konsisten seluruh field config. Dipakai oleh
 // handler HTTP agar tidak membaca struct yang sedang dimutasi (data race).
 type Snapshot struct {
-	ServerPort       string   `json:"server_port"`
-	JWTSecret        string   `json:"jwt_secret"`
-	LoginPath        string   `json:"login_path"`
-	AdminUsername    string   `json:"admin_username"`
-	AdminPassword    string   `json:"admin_password"`
-	AuditorUsername  string   `json:"auditor_username"`
-	AuditorPassword  string   `json:"auditor_password"`
-	WatchPaths       []string `json:"watch_paths"`
-	ScanIntervalSec  int      `json:"scan_interval_sec"`
-	WorkerCount      int      `json:"worker_count"`
-	TelegramToken    string   `json:"telegram_token"`
-	TelegramChatID   string   `json:"telegram_chat_id"`
-	BackupWebhookURL string   `json:"backup_webhook_url"`
-	AllowedOrigins   []string `json:"allowed_origins"`
-	DBPath           string   `json:"db_path"`
+	ServerPort        string   `json:"server_port"`
+	JWTSecret         string   `json:"jwt_secret"`
+	LoginPath         string   `json:"login_path"`
+	CookieSecure      bool     `json:"cookie_secure"`
+	MonitoringEnabled bool     `json:"monitoring_enabled"`
+	AdminUsername     string   `json:"admin_username"`
+	AdminPassword     string   `json:"admin_password"`
+	AuditorUsername   string   `json:"auditor_username"`
+	AuditorPassword   string   `json:"auditor_password"`
+	WatchPaths        []string `json:"watch_paths"`
+	ScanIntervalSec   int      `json:"scan_interval_sec"`
+	WorkerCount       int      `json:"worker_count"`
+	TelegramToken     string   `json:"telegram_token"`
+	TelegramChatID    string   `json:"telegram_chat_id"`
+	BackupWebhookURL  string   `json:"backup_webhook_url"`
+	AllowedOrigins    []string `json:"allowed_origins"`
+	DBPath            string   `json:"db_path"`
 }
 
 func (c *Config) Snapshot() Snapshot {
@@ -359,21 +398,23 @@ func (c *Config) Snapshot() Snapshot {
 	copy(origins, c.AllowedOrigins)
 
 	return Snapshot{
-		ServerPort:       c.ServerPort,
-		JWTSecret:        c.JWTSecret,
-		LoginPath:        c.LoginPath,
-		AdminUsername:    c.AdminUsername,
-		AdminPassword:    c.AdminPassword,
-		AuditorUsername:  c.AuditorUsername,
-		AuditorPassword:  c.AuditorPassword,
-		WatchPaths:       paths,
-		ScanIntervalSec:  c.ScanIntervalSec,
-		WorkerCount:      c.WorkerCount,
-		TelegramToken:    c.TelegramToken,
-		TelegramChatID:   c.TelegramChatID,
-		BackupWebhookURL: c.BackupWebhookURL,
-		AllowedOrigins:   origins,
-		DBPath:           c.DBPath,
+		ServerPort:        c.ServerPort,
+		JWTSecret:         c.JWTSecret,
+		LoginPath:         c.LoginPath,
+		CookieSecure:      c.CookieSecure,
+		MonitoringEnabled: c.MonitoringEnabled,
+		AdminUsername:     c.AdminUsername,
+		AdminPassword:     c.AdminPassword,
+		AuditorUsername:   c.AuditorUsername,
+		AuditorPassword:   c.AuditorPassword,
+		WatchPaths:        paths,
+		ScanIntervalSec:   c.ScanIntervalSec,
+		WorkerCount:       c.WorkerCount,
+		TelegramToken:     c.TelegramToken,
+		TelegramChatID:    c.TelegramChatID,
+		BackupWebhookURL:  c.BackupWebhookURL,
+		AllowedOrigins:    origins,
+		DBPath:            c.DBPath,
 	}
 }
 

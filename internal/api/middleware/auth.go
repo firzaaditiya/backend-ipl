@@ -3,7 +3,6 @@ package middleware
 import (
 	"errors"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -20,6 +19,50 @@ const (
 // tokenIssuer adalah issuer JWT yang wajib ada di setiap token valid.
 const tokenIssuer = "fim-ipl"
 
+// SessionCookieName adalah satu-satunya pembawa sesi. Sejak v1.1.0, JWT
+// TIDAK PERNAH dikirim lewat body JSON dan TIDAK PERNAH dibaca dari header
+// Authorization: browser menyimpannya sebagai cookie HttpOnly sehingga kode
+// JavaScript (termasuk skrip XSS yang lolos) tidak bisa membacanya, dan
+// cookie hanya dikirim ke path /api/v1 (bukan ke halaman statis maupun ke
+// situs WordPress yang dipantau).
+const SessionCookieName = "fim_session"
+
+// SetSessionCookie menulis cookie sesi setelah login berhasil. Atributnya
+// adalah jawaban atas dua serangan klasik cookie:
+//   - HttpOnly: cookie tidak terekspos ke document.cookie (tahan XSS).
+//   - SameSite=Lax: browser tidak mengirim cookie pada POST lintas situs
+//     (tahan CSRF dasar); router menambah pemeriksaan Origin untuk mutasi.
+//   - Secure: aktif di produksi (domain HTTPS); nonaktif hanya untuk dev
+//     HTTP lokal lewat FIM_COOKIE_SECURE=0.
+func SetSessionCookie(w http.ResponseWriter, token string, expiresAt time.Time, secure bool) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     SessionCookieName,
+		Value:    token,
+		Path:     "/api/v1",
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  expiresAt,
+		MaxAge:   int(time.Until(expiresAt).Seconds()),
+	})
+}
+
+// ClearSessionCookie menghapus cookie sesi (logout). Atribut Path, Secure,
+// dan SameSite harus sama dengan saat cookie dibuat agar browser benar-benar
+// menghapusnya, bukan membuat cookie kedua.
+func ClearSessionCookie(w http.ResponseWriter, secure bool) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     SessionCookieName,
+		Value:    "",
+		Path:     "/api/v1",
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  time.Unix(0, 0),
+		MaxAge:   -1,
+	})
+}
+
 type Claims struct {
 	Username string `json:"username"`
 	Role     string `json:"role"`
@@ -27,17 +70,12 @@ type Claims struct {
 }
 
 func ParseClaims(r *http.Request, secret string) (*Claims, bool) {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
+	cookie, err := r.Cookie(SessionCookieName)
+	if err != nil || cookie.Value == "" {
 		return nil, false
 	}
 
-	parts := strings.SplitN(authHeader, " ", 2)
-	if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-		return nil, false
-	}
-
-	tokenStr := parts[1]
+	tokenStr := cookie.Value
 
 	claims := &Claims{}
 	token, err := jwt.ParseWithClaims(

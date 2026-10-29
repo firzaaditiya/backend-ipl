@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 
 	"github.com/skripsi/fim-ipl/internal/backup"
@@ -103,9 +105,11 @@ func NewQuarantineHandler(cfg *config.Config, l *ledger.Ledger, hub *realtime.Hu
 	return &QuarantineHandler{cfg: cfg, ledger: l, hub: hub}
 }
 
-// Release mengembalikan permission file dari 000 → 0644 (rw-r--r--).
-// Hanya file yang berada di bawah watch path DAN berstatus terkarantina
-// terakhir yang boleh dirilis.
+// Release mengembalikan permission file dari 000 ke mode ASLINYA (yang
+// dicatat saat karantina). Hanya file yang berada di bawah watch path DAN
+// berstatus terkarantina terakhir yang boleh dirilis. Bila catatan mode
+// asli tidak ditemukan (file dikarantina sebelum v1.1.0), dipakai fallback
+// 0644 dan itu dilaporkan di respons agar admin tahu ada yang tidak persis.
 func (h *QuarantineHandler) Release(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -137,9 +141,21 @@ func (h *QuarantineHandler) Release(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := quarantine.Release(cleanPath); err != nil {
+	restoreMode := os.FileMode(0o644)
+	restoredOriginal := false
+	if stored, found, err := h.ledger.GetQuarantineMode(cleanPath); err == nil && found {
+		restoreMode = os.FileMode(stored)
+		restoredOriginal = true
+	}
+
+	if err := quarantine.Release(cleanPath, restoreMode); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+	// Catatan mode sudah tidak diperlukan lagi; kegagalan menghapusnya
+	// tidak membatalkan release (hanya log, agar tidak menumpuk).
+	if err := h.ledger.DeleteQuarantineMode(cleanPath); err != nil {
+		log.Printf("[Quarantine] Released %s but failed to clear mode record: %v", cleanPath, err)
 	}
 
 	// Catat tindakan manual ke ledger agar jejak "siapa melepas, kapan, file
@@ -154,13 +170,14 @@ func (h *QuarantineHandler) Release(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[Quarantine] Released %s but failed to record audit block: %v", cleanPath, err)
 	}
 
-	log.Printf("[Quarantine] Released: %s", cleanPath)
+	log.Printf("[Quarantine] Released: %s (mode %04o, original=%v)", cleanPath, restoreMode, restoredOriginal)
 	if h.hub != nil {
 		h.hub.Publish("quarantine_released", map[string]string{"file_path": cleanPath})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"message": "file permission restored to 0644",
-		"audited": audited,
+		"message":           fmt.Sprintf("file permission restored to %04o", restoreMode),
+		"restored_original": restoredOriginal,
+		"audited":           audited,
 	})
 }
 

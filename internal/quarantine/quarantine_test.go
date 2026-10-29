@@ -9,13 +9,18 @@ import (
 
 func TestApplyAndReleaseRegularFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "victim.php")
-	if err := os.WriteFile(path, []byte("<?php echo 1;"), 0o644); err != nil {
+	// Sengaja 0600 (bukan 0644): Release harus mengembalikan mode ASLI,
+	// bukan default. Ini yang diuji, karena 0644 akan melonggarkan file ini.
+	if err := os.WriteFile(path, []byte("<?php echo 1;"), 0o600); err != nil {
 		t.Fatalf("write victim: %v", err)
 	}
 
 	res := Apply(path)
 	if !res.Success || res.Err != nil {
 		t.Fatalf("expected quarantine success, got %+v", res)
+	}
+	if runtime.GOOS != "windows" && res.OriginalMode != 0o600 {
+		t.Fatalf("expected recorded original mode 0600, got %o", res.OriginalMode)
 	}
 
 	info, err := os.Stat(path)
@@ -26,12 +31,12 @@ func TestApplyAndReleaseRegularFile(t *testing.T) {
 		t.Fatalf("expected mode 000, got %o", info.Mode().Perm())
 	}
 
-	if err := Release(path); err != nil {
+	if err := Release(path, res.OriginalMode); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 	info, _ = os.Stat(path)
-	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o644 {
-		t.Fatalf("expected mode 0644 after release, got %o", info.Mode().Perm())
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Fatalf("expected original mode 0600 after release, got %o", info.Mode().Perm())
 	}
 }
 
@@ -60,7 +65,7 @@ func TestApplyAndReleaseRejectSymlink(t *testing.T) {
 	if res := Apply(link); res.Success || res.SkipReason == "" {
 		t.Fatalf("expected symlink to be skipped, got %+v", res)
 	}
-	if err := Release(link); err == nil {
+	if err := Release(link, 0o644); err == nil {
 		t.Fatal("expected Release to reject symlink")
 	}
 

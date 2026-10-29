@@ -82,6 +82,26 @@ func main() {
 	router := api.NewRouter(cfg, db, sc, tg, bm, hub)
 
 	snap := cfg.Snapshot()
+
+	// Auto-resume monitoring (sejak v1.1.0): status monitoring dipertahankan
+	// di config.json oleh handler Start/Stop, jadi restart proses (mis.
+	// systemctl restart, reboot VPS) TIDAK mematikan perlindungan secara
+	// diam-diam. Shutdown proses tidak mengubah flag ini; hanya tombol Stop
+	// di dashboard yang boleh mematikannya. Bila baseline kosong (mis. DB
+	// di-reset), flag dibersihkan agar tidak mencoba start tiap boot.
+	if snap.MonitoringEnabled {
+		if count, err := db.GetBaselineCount(); err != nil {
+			log.Printf("[FIM-IPL] Auto-resume skipped: cannot read baseline: %v", err)
+		} else if count == 0 {
+			log.Println("[FIM-IPL] Auto-resume skipped: baseline empty, clearing flag")
+			cfg.Update(func(c *config.Config) { c.MonitoringEnabled = false })
+			_ = cfg.Persist()
+		} else {
+			sc.StartMonitoring(snap.ScanIntervalSec)
+			log.Printf("[FIM-IPL] Monitoring auto-resumed (%d baseline files)", count)
+		}
+	}
+
 	server := &http.Server{
 		Addr:              snap.ServerPort,
 		Handler:           router,
@@ -372,6 +392,12 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, tg *notifier.Teleg
 			default:
 				quarantinedCount++
 				log.Printf("[Quarantine] OK: %s (chmod 000)", event.FilePath)
+				// Catat permission asli agar Release mengembalikannya
+				// persis (bukan default 0644). Gagal mencatat tidak
+				// membatalkan karantina; Release memakai fallback 0644.
+				if err := db.RecordQuarantineMode(event.FilePath, uint32(qres.OriginalMode)); err != nil {
+					log.Printf("[Quarantine] Failed to record original mode for %s: %v", event.FilePath, err)
+				}
 			}
 		}
 

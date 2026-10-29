@@ -70,6 +70,41 @@ func TestCheckExternalSecretsRejectsDiskCredentials(t *testing.T) {
 	}
 }
 
+func TestCheckExternalSecretsAllowsEnvCredentials(t *testing.T) {
+	// Regresi v1.1.0: deployment yang seluruh kredensialnya dari environment
+	// sebelumnya selalu gagal boot karena pemeriksaan lama tidak membedakan
+	// sumber nilai (disk vs environment).
+	t.Setenv("FIM_REQUIRE_EXTERNAL_SECRETS", "1")
+	c := &Config{
+		JWTSecret:      "env-secret",
+		AdminPassword:  "env-hash",
+		TelegramToken:  "env-token",
+		TelegramChatID: "123",
+		envOverrides: map[string]bool{
+			"jwt_secret": true, "admin_password": true,
+			"telegram_token": true, "telegram_chat_id": true,
+		},
+	}
+	if err := checkExternalSecrets(c); err != nil {
+		t.Fatalf("credential dari environment seharusnya diizinkan: %v", err)
+	}
+}
+
+func TestCheckExternalSecretsRejectsMixedSources(t *testing.T) {
+	t.Setenv("FIM_REQUIRE_EXTERNAL_SECRETS", "1")
+	c := &Config{
+		JWTSecret:     "env-secret",
+		TelegramToken: "disk-token",
+		envOverrides:  map[string]bool{"jwt_secret": true},
+	}
+	if err := checkExternalSecrets(c); err == nil {
+		t.Fatal("credential dari disk harus tetap ditolak walau sebagian dari env")
+	}
+	if err := checkExternalSecrets(c); !strings.Contains(err.Error(), "telegram_token") {
+		t.Fatalf("pesan harus menyebut field dari disk: %v", err)
+	}
+}
+
 func TestCheckExternalSecretsAllowsEmptyDiskConfig(t *testing.T) {
 	t.Setenv("FIM_REQUIRE_EXTERNAL_SECRETS", "1")
 	if err := checkExternalSecrets(&Config{}); err != nil {

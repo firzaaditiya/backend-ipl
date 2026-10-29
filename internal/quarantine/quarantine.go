@@ -6,7 +6,15 @@
 // Design decision:
 //   - Kegagalan chmod bukan sekadar log; caller wajib mengirim notifikasi
 //     "URGENT: Quarantine Failed" ke Telegram (dilakukan di layer scanner).
-//   - Fungsi Release() memulihkan permission ke 0644 (default file WordPress).
+//   - Apply mencatat permission asli file di Result.OriginalMode; caller
+//     menyimpannya (ledger) agar Release bisa mengembalikan permission
+//     persis seperti semula, bukan ke default 0644. File yang permission
+//     aslinya 0600 atau 0755 harus kembali ke nilai itu setelah
+//     investigasi, karena 0644 bisa melonggarkan (0600) atau mengunci
+//     (0755) file yang sah.
+//   - Fungsi Release() menerima mode target eksplisit; fallback 0644 hanya
+//     dipakai caller bila catatan mode asli tidak ditemukan (file yang
+//     dikarantina sebelum v1.1.0).
 package quarantine
 
 import (
@@ -17,10 +25,11 @@ import (
 
 // Result menggambarkan hasil upaya karantina.
 type Result struct {
-	Path       string
-	Success    bool
-	Err        error
-	SkipReason string // diisi jika file di-skip (mis. DELETED)
+	Path         string
+	Success      bool
+	Err          error
+	SkipReason   string      // diisi jika file di-skip (mis. DELETED)
+	OriginalMode os.FileMode // permission file SEBELUM chmod 000 (0 bila di-skip)
 }
 
 // Apply mencoba menerapkan chmod 000 pada file target.
@@ -48,6 +57,8 @@ func Apply(path string) Result {
 		return res
 	}
 
+	res.OriginalMode = info.Mode().Perm()
+
 	if err := os.Chmod(path, 0o000); err != nil {
 		res.Err = fmt.Errorf("chmod 000: %w", err)
 		return res
@@ -57,9 +68,10 @@ func Apply(path string) Result {
 	return res
 }
 
-// Release mengembalikan permission file ke 0644 (rw-r--r--) sehingga admin
-// bisa memeriksa isi file setelah investigasi selesai.
-func Release(path string) error {
+// Release mengembalikan permission file ke mode target (normalnya mode asli
+// yang dicatat Apply). Admin bisa memeriksa isi file setelah investigasi
+// selesai tanpa mengubah hak aksesnya secara diam-diam.
+func Release(path string, mode os.FileMode) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("stat: %w", err)
@@ -70,8 +82,8 @@ func Release(path string) error {
 	if info.IsDir() {
 		return fmt.Errorf("target is a directory")
 	}
-	if err := os.Chmod(path, 0o644); err != nil {
-		return fmt.Errorf("chmod 0644: %w", err)
+	if err := os.Chmod(path, mode); err != nil {
+		return fmt.Errorf("chmod %04o: %w", mode, err)
 	}
 	return nil
 }

@@ -13,8 +13,23 @@ const testSecret = "test-secret-value"
 
 func requestWithToken(token string) *http.Request {
 	r := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/stats", nil)
-	r.Header.Set("Authorization", "Bearer "+token)
+	r.AddCookie(&http.Cookie{Name: SessionCookieName, Value: token, Path: "/api/v1"})
 	return r
+}
+
+func TestParseClaimsRejectsBearerHeader(t *testing.T) {
+	// Sejak v1.1.0 header Authorization tidak lagi diterima: satu-satunya
+	// pembawa sesi adalah cookie HttpOnly. Token yang dikirim lewat header
+	// harus ditolak meskipun tandatangannya valid.
+	token, _, err := GenerateToken("user", RoleSuperAdmin, testSecret, 1)
+	if err != nil {
+		t.Fatalf("GenerateToken: %v", err)
+	}
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/stats", nil)
+	r.Header.Set("Authorization", "Bearer "+token)
+	if _, ok := ParseClaims(r, testSecret); ok {
+		t.Fatal("expected Bearer header to be rejected (cookie-only auth)")
+	}
 }
 
 func TestGenerateTokenRejectsUnknownRole(t *testing.T) {

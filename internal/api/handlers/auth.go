@@ -79,12 +79,57 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Token TIDAK dikembalikan di body JSON (sejak v1.1.0): ia hanya hidup
+	// di cookie HttpOnly agar tidak bisa dibaca JavaScript. Frontend cukup
+	// membaca role/username dari respons ini, lalu membuktikan sesi lewat
+	// GET /api/v1/auth/me pada setiap refresh halaman.
+	middleware.SetSessionCookie(w, token, expiresAt, snap.CookieSecure)
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"token":      token,
 		"expires_at": expiresAt,
 		"role":       role,
 		"username":   req.Username,
+	})
+}
+
+// Logout menghapus cookie sesi di browser. Endpoint ini sengaja tetap
+// terproteksi (butuh cookie valid): logout tanpa sesi tidak ada artinya,
+// dan frontend selalu membersihkan state lokalnya walau respons ini 401.
+func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	snap := h.cfg.Snapshot()
+	middleware.ClearSessionCookie(w, snap.CookieSecure)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "logged out"})
+}
+
+// Me mengembalikan identitas pemilik cookie sesi. Ini satu-satunya cara
+// frontend mengetahui siapa yang login setelah refresh halaman, karena
+// token tidak lagi tersedia di JavaScript.
+func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	snap := h.cfg.Snapshot()
+	claims, ok := middleware.ParseClaims(r, snap.JWTSecret)
+	if !ok {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"username":   claims.Username,
+		"role":       claims.Role,
+		"expires_at": claims.ExpiresAt.Time,
 	})
 }
 

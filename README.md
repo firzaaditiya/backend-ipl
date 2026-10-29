@@ -105,12 +105,65 @@ sebaiknya hanya diberikan lewat environment atau systemd credentials.
 | `FIM_TELEGRAM_TOKEN` | Token bot Telegram |
 | `FIM_TELEGRAM_CHAT_ID` | Tujuan chat Telegram |
 | `FIM_ALLOWED_ORIGINS` | Daftar origin CORS dipisahkan koma |
+| `FIM_COOKIE_SECURE` | `1` (default) = cookie sesi memakai atribut Secure; `0` hanya untuk dev HTTP lokal |
 | `FIM_STRICT_SECRETS=1` | Tolak JWT secret lemah |
 | `FIM_REQUIRE_EXTERNAL_SECRETS=1` | Tolak credential di `config.json` |
 | `FIM_REQUIRE_LOCAL_API=1` | Tolak binding API wildcard |
 
 `FIM_REQUIRE_EXTERNAL_SECRETS=1` dan `FIM_REQUIRE_LOCAL_API=1` sebaiknya selalu
-dipakai di server produksi.
+dipakai di server produksi, DENGAN satu pengecualian: `FIM_REQUIRE_EXTERNAL_SECRETS=1`
+tidak kompatibel dengan penyimpanan Telegram/Auditor lewat Settings API (API itu
+memang menulis ke `config.json`). Deployment yang memakai Settings API harus
+mematikan flag tersebut dan menerima `config.json` (0600, milik `fim-ipl`)
+sebagai sumber kebenaran runtime untuk Telegram dan Auditor, sementara JWT
+secret dan password admin tetap dari `fim.env` (environment menang atas
+`config.json` saat restart).
+
+## Sesi dan autentikasi (v1.1.0)
+
+Satu-satunya mekanisme autentikasi adalah cookie sesi HttpOnly:
+
+- Login (`POST /api/v1/secure-gate`) TIDAK mengembalikan token di body JSON.
+  Server menulis cookie `fim_session` (`Path=/api/v1`, `HttpOnly`,
+  `SameSite=Lax`, `Secure` bila `FIM_COOKIE_SECURE=1`) berisi JWT HS256
+  24 jam dengan klaim role. JavaScript tidak bisa membaca cookie ini,
+  sehingga token tidak bisa dicuri lewat XSS.
+- Header `Authorization: Bearer` TIDAK lagi diterima (sengaja, agar tidak ada
+  dua jalur autentikasi). Frontend membuktikan sesi lewat `GET /api/v1/auth/me`
+  pada setiap refresh halaman, dan keluar lewat `POST /api/v1/auth/logout`
+  yang menghapus cookie.
+- CSRF: selain `SameSite=Lax`, request mutasi (`POST`/`PUT`/`DELETE`/`PATCH`)
+  diperiksa Origin-nya — lolos bila Origin kosong (curl/alat admin), sama
+  dengan Host request (same-origin lewat proxy), atau ada di allowlist.
+  Pemeriksaan nonaktif bila allowlist kosong, jadi produksi wajib mengisi
+  `allowed_origins` dengan origin dashboard.
+- Frontend dan API WAJIB satu origin (proxy Nginx yang sama). Desain ini
+  sengaja: tidak ada CORS lintas origin untuk dashboard.
+
+## Status monitoring antar restart
+
+Status monitoring dipertahankan di `config.json` (`monitoring_enabled`) oleh
+endpoint Start/Stop, dan daemon melanjutkannya otomatis saat boot bila
+baseline tidak kosong. Restart proses (systemctl restart, reboot) TIDAK
+menghapus flag ini — hanya tombol Stop di dashboard yang boleh mematikannya.
+Maintenance mode sengaja TIDAK dipertahankan: restart mengakhirinya agar
+perlindungan kembali aktif (fail-safe).
+
+## Karantina: permission asli dikembalikan
+
+Saat karantina berhasil, permission asli file dicatat di ledger (bucket
+terpisah, bukan bagian hash-chain). Release mengembalikan permission persis
+itu; bila catatan tidak ada (file dikarantina sebelum v1.1.0), dipakai
+fallback 0644 dan respons menandainya (`restored_original=false`).
+
+## Latensi deteksi: polling, bukan real-time
+
+Deteksi berjalan per siklus polling (`filepath.Walk` + `time.Ticker`,
+default 120 detik, minimal 30 detik), jadi jeda deteksi maksimum adalah satu
+interval. Yang real-time adalah pembaruan dashboard SETELAH deteksi, lewat
+SSE (`/api/v1/events`). Naskah dan presentasi harus memakai istilah ini
+secara tepat: "deteksi polling deterministik, notifikasi dashboard real-time
+via SSE", bukan "deteksi real-time".
 
 ## Deployment Linux dengan systemd
 

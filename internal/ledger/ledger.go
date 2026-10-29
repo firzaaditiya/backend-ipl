@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -17,10 +18,11 @@ import (
 )
 
 var (
-	bucketBlocks   = []byte("blocks")
-	bucketBaseline = []byte("baseline")
-	bucketMeta     = []byte("meta")
-	bucketMetrics  = []byte("metrics")
+	bucketBlocks          = []byte("blocks")
+	bucketBaseline        = []byte("baseline")
+	bucketMeta            = []byte("meta")
+	bucketMetrics         = []byte("metrics")
+	bucketQuarantineModes = []byte("quarantine_modes")
 )
 
 const genesisPrevHash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -59,7 +61,7 @@ func New(dbPath string) (*Ledger, error) {
 	}
 
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketBlocks, bucketBaseline, bucketMeta, bucketMetrics} {
+		for _, b := range [][]byte{bucketBlocks, bucketBaseline, bucketMeta, bucketMetrics, bucketQuarantineModes} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -161,6 +163,65 @@ func (l *Ledger) UpdateBaselineEntry(record models.FileRecord) error {
 func (l *Ledger) RemoveBaselineEntry(path string) error {
 	return l.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketBaseline)
+		if b == nil {
+			return nil
+		}
+		return b.Delete([]byte(path))
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Quarantine original modes
+// ---------------------------------------------------------------------------
+//
+// Saat file dikarantina (chmod 000), permission aslinya dicatat di bucket
+// ini agar Release bisa mengembalikannya persis seperti semula, bukan ke
+// nilai default 0644. Bucket ini BUKAN bagian dari hash-chain (isinya
+// status operasional, bukan jejak audit), sehingga penambahannya tidak
+// mengubah verifikasi blok-blok lama. Entri dihapus saat file dirilis;
+// bila entri tidak ditemukan (file dikarantina sebelum v1.1.0), Release
+// memakai fallback 0644.
+
+// RecordQuarantineMode menyimpan permission asli file yang dikarantina.
+func (l *Ledger) RecordQuarantineMode(path string, mode uint32) error {
+	return l.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketQuarantineModes)
+		if b == nil {
+			return nil
+		}
+		var buf [4]byte
+		binary.BigEndian.PutUint32(buf[:], mode)
+		return b.Put([]byte(path), buf[:])
+	})
+}
+
+// GetQuarantineMode mengembalikan permission asli file. found=false berarti
+// tidak ada catatan (file lama atau tidak pernah dikarantina lewat v1.1.0).
+func (l *Ledger) GetQuarantineMode(path string) (uint32, bool, error) {
+	var (
+		mode  uint32
+		found bool
+	)
+	err := l.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketQuarantineModes)
+		if b == nil {
+			return nil
+		}
+		v := b.Get([]byte(path))
+		if v == nil || len(v) != 4 {
+			return nil
+		}
+		mode = binary.BigEndian.Uint32(v)
+		found = true
+		return nil
+	})
+	return mode, found, err
+}
+
+// DeleteQuarantineMode menghapus catatan permission setelah file dirilis.
+func (l *Ledger) DeleteQuarantineMode(path string) error {
+	return l.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketQuarantineModes)
 		if b == nil {
 			return nil
 		}

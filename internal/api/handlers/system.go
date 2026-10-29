@@ -11,7 +11,10 @@ import (
 )
 
 // AppVersion adalah versi aplikasi yang ditampilkan di UI dan /healthz.
-const AppVersion = "1.0.0"
+// 1.1.0 = autentikasi pindah ke cookie HttpOnly (breaking change dari
+// localStorage + header Authorization), monitoring dipertahankan antar
+// restart, dan release karantina mengembalikan permission asli.
+const AppVersion = "1.1.0"
 
 // SystemHandler menyajikan informasi runtime yang aman untuk ditampilkan di UI.
 // Tidak ada secret, path data, atau kredensial yang dikembalikan.

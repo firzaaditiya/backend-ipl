@@ -3,6 +3,7 @@ package api
 import (
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/skripsi/fim-ipl/internal/api/handlers"
@@ -22,8 +23,12 @@ const maxBodyBytes = 1 << 20
 // NewRouter membangun HTTP handler untuk seluruh REST API.
 // Middleware yang diterapkan (dari luar ke dalam):
 //
-//	CORS  →  RateLimit  →  Route matcher  →  JWT (untuk endpoint terproteksi)
+//	CORS  →  RateLimit  →  CSRF (pemeriksaan Origin untuk mutasi)  →
+//	Route matcher  →  JWT cookie (untuk endpoint terproteksi)
 //
+// Autentikasi sejak v1.1.0 hanya memakai cookie HttpOnly (SameSite=Lax).
+// Header Authorization TIDAK lagi diterima, dan CORS tidak lagi
+// mengizinkannya, agar tidak ada dua jalur autentikasi yang membingungkan.
 // Rate limit default 60 req/menit per-IP dengan burst penuh 60.
 func NewRouter(
 	cfg *config.Config,
@@ -65,7 +70,7 @@ func NewRouter(
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 
 		if r.Method == http.MethodOptions {
@@ -88,6 +93,25 @@ func NewRouter(
 			return
 		}
 
+		// -------- CSRF: pemeriksaan Origin untuk request mutasi --------
+		// Cookie sesi dikirim otomatis oleh browser, jadi endpoint mutasi
+		// wajib memastikan request datang dari origin yang sah. SameSite=Lax
+		// sudah memblokir POST lintas situs di browser modern; pemeriksaan
+		// ini adalah lapis kedua untuk klien yang mengabaikan SameSite.
+		// Aturan: lolos bila Origin kosong (curl/alat admin), Origin
+		// sama dengan Host request (same-origin lewat proxy), atau Origin
+		// ada di allowlist. Bila allowlist kosong (mode lama), pemeriksaan
+		// dinonaktifkan — produksi wajib mengisi allowlist.
+		if r.Method == http.MethodPost || r.Method == http.MethodPut ||
+			r.Method == http.MethodDelete || r.Method == http.MethodPatch {
+			if csrfOriginRejected(r, cfg.GetAllowedOrigins()) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				w.Write([]byte(`{"error":"forbidden: origin not allowed"}`))
+				return
+			}
+		}
+
 		// -------- Public endpoints --------
 		if path == "/api/v1/healthz" {
 			systemHandler.Health(w, r)
@@ -107,7 +131,7 @@ func NewRouter(
 			return
 		}
 
-		// -------- JWT + RBAC --------
+		// -------- JWT cookie + RBAC --------
 		claims, ok := middleware.ParseClaims(r, jwtSecret)
 		if !ok {
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
@@ -152,6 +176,12 @@ func NewRouter(
 				return
 			}
 			authHandler.SetupAuditor(w, r)
+
+		case path == "/api/v1/auth/me":
+			authHandler.Me(w, r)
+
+		case path == "/api/v1/auth/logout":
+			authHandler.Logout(w, r)
 
 		case path == "/api/v1/settings":
 			switch r.Method {
@@ -223,6 +253,23 @@ func NewRouter(
 	})
 
 	return middleware.Recover(log.Default(), middleware.SecurityHeaders(core))
+}
+
+// csrfOriginRejected memutuskan apakah request mutasi harus ditolak karena
+// Origin-nya tidak sah. Lihat penjelasan di NewRouter.
+func csrfOriginRejected(r *http.Request, allowed []string) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" || len(allowed) == 0 {
+		return false
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" {
+		return true
+	}
+	if parsed.Host == r.Host {
+		return false
+	}
+	return !originAllowed(allowed, origin)
 }
 
 // originAllowed membandingkan origin secara case-insensitive dan mengabaikan

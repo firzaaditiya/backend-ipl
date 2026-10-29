@@ -80,24 +80,41 @@ func checkSecrets(c *Config) error {
 // menjadi tempat penyimpanan credential deployment. Menyembunyikan nama file
 // tidak membantu bila attacker sudah mendapat shell; memindahkan secret ke
 // environment/secret manager dan memisahkan user OS-lah yang memberi batas.
+//
+// PENTING (bug yang diperbaiki v1.1.0): pemeriksaan ini harus sadar sumber.
+// Sebelumnya ia menolak bila field credential TIDAK KOSONG di memori, padahal
+// applyEnvOverrides sudah menimpa field itu dengan nilai environment — jadi
+// deployment yang 100% memakai environment pun selalu gagal boot. Sekarang
+// field yang berasal dari environment (tercatat di envOverrides) diizinkan;
+// hanya field yang benar-benar berasal dari config.json yang ditolak.
+//
+// Konsekuensi yang harus dipahami penguji: mode ini TIDAK kompatibel dengan
+// penyimpanan Telegram/Auditor lewat Settings API, karena API itu memang
+// menulis ke config.json. Deployment yang memakai Settings API (seperti
+// produksi TPQ Al-Fawwaz) harus mematikan flag ini dan menerima config.json
+// (0600, milik fim-ipl) sebagai sumber kebenaran runtime untuk Telegram dan
+// Auditor, sementara JWT secret + password admin tetap dari fim.env.
 func checkExternalSecrets(c *Config) error {
 	if os.Getenv("FIM_REQUIRE_EXTERNAL_SECRETS") != "1" {
 		return nil
 	}
+	fromEnv := func(key string) bool {
+		return c.envOverrides != nil && c.envOverrides[key]
+	}
 	var fields []string
-	if c.JWTSecret != "" {
+	if c.JWTSecret != "" && !fromEnv("jwt_secret") {
 		fields = append(fields, "jwt_secret")
 	}
-	if c.AdminPassword != "" {
+	if c.AdminPassword != "" && !fromEnv("admin_password") {
 		fields = append(fields, "admin_password")
 	}
-	if c.AuditorPassword != "" {
+	if c.AuditorPassword != "" && !fromEnv("auditor_password") {
 		fields = append(fields, "auditor_password")
 	}
-	if c.TelegramToken != "" {
+	if c.TelegramToken != "" && !fromEnv("telegram_token") {
 		fields = append(fields, "telegram_token")
 	}
-	if c.TelegramChatID != "" {
+	if c.TelegramChatID != "" && !fromEnv("telegram_chat_id") {
 		fields = append(fields, "telegram_chat_id")
 	}
 	if len(fields) > 0 {
