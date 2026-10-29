@@ -103,7 +103,8 @@ type LoginRequest struct {
 	Password string `json:"password"`
 }
 
-type LoginResponse struct {
-	Token     string    `json:"token"`
-	ExpiresAt time.Time `json:"expires_at"`
-}
+// Catatan v1.2.0: struct LoginResponse yang lama (dengan field Token) sengaja
+// dihapus karena sejak v1.1.0 token tidak pernah dikembalikan di badan JSON;
+// token hanya hidup di kuki HttpOnly. Menyimpan struct itu hanya akan
+// membingungkan pembaca kode dan penguji yang mengira masih ada jalur token
+// lewat JSON.

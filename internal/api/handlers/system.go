@@ -14,7 +14,10 @@ import (
 // 1.1.0 = autentikasi pindah ke cookie HttpOnly (breaking change dari
 // localStorage + header Authorization), monitoring dipertahankan antar
 // restart, dan release karantina mengembalikan permission asli.
-const AppVersion = "1.1.0"
+// 1.2.0 = karantina dan pelepasan diverifikasi ulang dengan membaca kembali
+// izin berkas (bukan hanya dari galat chmod), dan dasbor menampilkan hitung
+// mundur pemindaian berikutnya agar polling deterministik dapat diamati.
+const AppVersion = "1.2.0"
 
 // SystemHandler menyajikan informasi runtime yang aman untuk ditampilkan di UI.
 // Tidak ada secret, path data, atau kredensial yang dikembalikan.

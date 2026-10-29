@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 )
 
 // Result menggambarkan hasil upaya karantina.
@@ -64,6 +65,25 @@ func Apply(path string) Result {
 		return res
 	}
 
+	// Sejak v1.2.0, keberhasilan karantina diverifikasi ulang dengan membaca
+	// kembali izin berkas. Perintah chmod yang tidak mengembalikan galat
+	// belum tentu melumpuhkan berkas (mis. sistem berkas yang mengabaikan
+	// chmod); tanpa verifikasi ini, karantina bisa dilaporkan berhasil
+	// padahal berkas masih dapat dibaca. Windows dikecualikan karena
+	// semantik izinnya berbeda dan ditangani sebagai fallback read-only
+	// pada lapisan sistem.
+	if runtime.GOOS != "windows" {
+		after, err := os.Lstat(path)
+		if err != nil {
+			res.Err = fmt.Errorf("verify quarantine: %w", err)
+			return res
+		}
+		if after.Mode().Perm() != 0o000 {
+			res.Err = fmt.Errorf("quarantine verification failed: mode is %04o, expected 000", after.Mode().Perm())
+			return res
+		}
+	}
+
 	res.Success = true
 	return res
 }
@@ -84,6 +104,19 @@ func Release(path string, mode os.FileMode) error {
 	}
 	if err := os.Chmod(path, mode); err != nil {
 		return fmt.Errorf("chmod %04o: %w", mode, err)
+	}
+	// Verifikasi pelepasan yang sama seperti pada Apply (v1.2.0): pelepasan
+	// hanya dinyatakan berhasil bila izin hasil pelepasan benar-benar sama
+	// dengan izin target, agar operator tidak mengira berkas sudah pulih
+	// padahal izinnya masih 000 atau masih salah.
+	if runtime.GOOS != "windows" {
+		after, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("verify release: %w", err)
+		}
+		if after.Mode().Perm() != mode.Perm() {
+			return fmt.Errorf("release verification failed: mode is %04o, expected %04o", after.Mode().Perm(), mode.Perm())
+		}
 	}
 	return nil
 }

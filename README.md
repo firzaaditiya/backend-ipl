@@ -156,6 +156,22 @@ terpisah, bukan bagian hash-chain). Release mengembalikan permission persis
 itu; bila catatan tidak ada (file dikarantina sebelum v1.1.0), dipakai
 fallback 0644 dan respons menandainya (`restored_original=false`).
 
+## Verifikasi karantina (v1.2.0)
+
+Sejak v1.2.0, `quarantine.Apply` dan `quarantine.Release` tidak lagi
+dinyatakan berhasil hanya karena `chmod` tidak mengembalikan galat. Setelah
+chmod diterapkan, izin berkas dibaca kembali dan dibandingkan dengan izin
+target (000 untuk karantina, izin asli atau 0644 untuk pelepasan). Bila
+verifikasi gagal, operasi dilaporkan gagal, sehingga karantina yang
+diabaikan sistem berkas tidak pernah dilaporkan berhasil secara diam-diam.
+Windows dikecualikan dari verifikasi mode karena semantik izinnya berbeda.
+
+Dasbor versi 1.2.0 juga menampilkan hitung mundur pemindaian berikutnya,
+yang dihitung dari siklus terakhir yang tercatat pada metrik ditambah
+interval yang dikonfigurasi. Hitung mundur ini bernilai kosong (bukan
+tebakan) bila pemantauan berhenti, mode pemeliharaan aktif, atau belum ada
+siklus yang tercatat.
+
 ## Latensi deteksi: polling, bukan real-time
 
 Deteksi berjalan per siklus polling (`filepath.Walk` + `time.Ticker`,
