@@ -1,43 +1,71 @@
 # FIM-IPL Backend
 
-Go-based File Integrity Monitoring daemon and REST API for FIM-IPL. The
-backend compares SHA-256 file hashes against a baseline, records changes in a
-local append-only hash-chained Immutable Private Ledger, quarantines suspicious
-files, and publishes operational alerts through Telegram.
+FIM-IPL Backend adalah daemon File Integrity Monitoring (FIM) dan REST API
+untuk memantau perubahan file pada server web. Sistem membandingkan hash
+SHA-256 dengan baseline, mencatat kejadian ke Immutable Private Ledger lokal,
+menonaktifkan file mencurigakan, dan mengirim notifikasi operasional.
 
-## Features
+Repository ini mandiri. Semua command, konfigurasi contoh, deployment unit,
+dan script simulasi yang diperlukan untuk menjalankan backend ada di dalam
+repository ini.
 
-- Polling scanner using `filepath.Walk`, a worker pool, and SHA-256.
-- Detection of `CREATED`, `MODIFIED`, `DELETED`, and `UNREADABLE` files.
-- Automatic quarantine with platform-aware behavior:
-  - Linux: `chmod 000`.
-  - Windows: best-effort ReadOnly attribute; official performance evidence is
-    taken on Linux/VPS.
-- Append-only Bbolt ledger with hash-chain verification and external head
-  anchor support.
-- Telegram alerts, ledger backups, retry for transient network/429/5xx errors,
-  and token redaction in errors.
-- JWT authentication, bcrypt passwords, Super Admin/Auditor RBAC, rate limit,
-  CORS allowlist, security headers, SSE events, and SSRF-safe webhook checks.
-- Environment overrides for secrets so credentials are not written back to
-  `config.json`.
+## Cara Kerja
 
-## Requirements
+```text
+watch directory
+      |
+      v
+filepath.Walk + worker pool + SHA-256
+      |
+      v
+bandingkan dengan baseline
+      |
+      +--> CREATED / MODIFIED --> quarantine --> ledger --> Telegram
+      +--> DELETED ------------> ledger -----------------> Telegram
+      +--> UNREADABLE ---------> alert + ledger ----------> Telegram
+      |
+      v
+metrics + SSE + dashboard API
+```
 
-- Go 1.25+.
-- Linux is recommended for production. Windows is supported for local demo and
-  functional testing.
-- A readable watch directory and a writable private data directory.
+Scanner menggunakan polling dengan `time.Ticker`, bukan filesystem event
+watcher. Pendekatan ini dipilih agar perilaku deterministik, portabel di Linux
+dan Windows, serta tidak kehilangan perubahan ketika daemon restart.
 
-## Local Run
+## Fitur
 
-Copy the example configuration and set secrets through environment variables:
+- Hash SHA-256 untuk baseline dan perubahan file.
+- Worker pool untuk pemindaian paralel.
+- Aksi `CREATED`, `MODIFIED`, `DELETED`, dan `UNREADABLE`.
+- Karantina Linux dengan `chmod 000`.
+- Karantina Windows dengan best-effort ReadOnly attribute.
+- Immutable Private Ledger lokal berbasis Bbolt dan hash-chain.
+- Verifikasi chain dan external head anchor.
+- Export dan backup ledger ke Telegram/webhook.
+- Retry Telegram untuk error jaringan, HTTP 429, dan HTTP 5xx.
+- JWT HS256, bcrypt, RBAC Super Admin/Auditor, rate limit, CORS, security
+  headers, SSRF-safe webhook validation, dan SSE realtime.
+- Environment override untuk semua secret deployment.
+- Mode strict yang menolak secret di `config.json`.
+
+## Persyaratan
+
+- Go 1.25 atau lebih baru.
+- Linux direkomendasikan untuk deployment produksi.
+- Windows didukung untuk pengembangan dan simulasi fungsional.
+- `curl` untuk health check.
+- Telegram Bot API hanya diperlukan jika notifikasi Telegram dipakai.
+
+## Menjalankan Lokal
+
+Salin konfigurasi contoh. File hasil salinan bersifat lokal dan tidak boleh
+dimasukkan Git:
 
 ```bash
 cp data/config.example.json data/config.json
 export FIM_CONFIG_PATH="$PWD/data/config.json"
-export FIM_JWT_SECRET="replace-with-at-least-32-random-characters"
-export FIM_ADMIN_PASSWORD="replace-with-a-strong-password"
+export FIM_JWT_SECRET="buat-rahasia-acak-minimal-32-karakter"
+export FIM_ADMIN_PASSWORD="buat-password-admin-kuat"
 go run ./cmd/server
 ```
 
@@ -47,124 +75,163 @@ Health check:
 curl http://127.0.0.1:8080/api/v1/healthz
 ```
 
-On Windows PowerShell, use `$env:FIM_*` equivalents. Do not commit
-`data/config.json`, database files, tokens, passwords, or webhook credentials.
-
-## Environment Variables
-
-| Variable | Purpose |
-| --- | --- |
-| `FIM_CONFIG_PATH` | Configuration file location |
-| `FIM_SERVER_PORT` | API listen address/port override |
-| `FIM_DB_PATH` | Bbolt database location override |
-| `FIM_JWT_SECRET` | JWT signing secret, minimum 32 characters |
-| `FIM_ADMIN_USERNAME` | Super Admin username override |
-| `FIM_ADMIN_PASSWORD` | Super Admin password override |
-| `FIM_AUDITOR_USERNAME` | Auditor username override |
-| `FIM_AUDITOR_PASSWORD` | Auditor password override |
-| `FIM_TELEGRAM_TOKEN` | Telegram bot token |
-| `FIM_TELEGRAM_CHAT_ID` | Telegram destination |
-| `FIM_ALLOWED_ORIGINS` | Comma-separated CORS origins |
-| `FIM_STRICT_SECRETS` | Set to `1` to fail startup for weak JWT secrets |
-| `FIM_REQUIRE_EXTERNAL_SECRETS` | Reject credentials in `config.json` when set to `1` |
-| `FIM_REQUIRE_LOCAL_API` | Reject non-local API binding when set to `1` |
-
-## API Overview
-
-The API is mounted below `/api/v1`.
-
-- `GET /healthz` - public liveness check.
-- `POST /secure-gate` - login and JWT issuance.
-- `GET /dashboard/stats` - current baseline, anomaly, and quarantine summary.
-- `GET /ledger/blocks` - paginated and filterable audit blocks.
-- `GET /ledger/verify` - verify the complete hash chain.
-- `GET /ledger/export` - export ledger JSON for off-host backup.
-- `GET /metrics` - scan performance metrics.
-- `GET /events` - authenticated realtime SSE stream.
-- `POST /baseline/init` and `/baseline/update` - Super Admin only.
-- `POST /monitoring/start` and `/monitoring/stop` - Super Admin only.
-- `POST /maintenance/enable` and `/maintenance/disable` - Super Admin only.
-- `POST /quarantine/release` - audited quarantine release.
-- `POST /backup/run` - manual ledger backup.
-
-See `internal/api/router.go` for the complete route wiring.
-
-## Production Deployment
-
-Use `deploy/fim-ipl.service` as the systemd template. Run the daemon as a
-dedicated `fim-ipl` user, never as `www-data` or the web application user.
-Keep `/etc/fim-ipl/fim.env` owned by `root:root` with mode `0600`, use
-`FIM_STRICT_SECRETS=1`, and keep the ledger/config directory inaccessible to
-the web user. The daemon only needs read access to the monitored web root.
-
-Example secret file:
-
-```text
-FIM_STRICT_SECRETS=1
-FIM_JWT_SECRET=replace-with-a-random-secret
-FIM_ADMIN_PASSWORD=replace-with-a-strong-password
-FIM_TELEGRAM_TOKEN=replace-with-a-new-token
-FIM_TELEGRAM_CHAT_ID=replace-with-a-chat-id
-```
-
-If the web application and the FIM daemon run as the same OS user, a web
-compromise can read the daemon's secrets and ledger. Separate OS identities
-are therefore required, not an optional optimization.
-
-### Web compromise threat model
-
-If an attacker uploads a file manager or obtains a remote shell as `www-data`,
-assume they can read everything owned/readable by `www-data`. There is no
-reliable "hidden config" technique that defeats a user who already has those
-permissions. The deployment boundary must therefore be:
-
-- Web files are readable by the FIM user, but `/opt/fim-ipl/data` is not
-  readable by `www-data`.
-- Secrets are loaded from `/etc/fim-ipl/fim.env` or systemd credentials, not
-  from the project directory or webroot.
-- `FIM_REQUIRE_EXTERNAL_SECRETS=1` rejects credentials in `config.json`.
-- `FIM_REQUIRE_LOCAL_API=1` rejects wildcard API binding. Put Nginx/Caddy in
-  front if remote operator access is needed.
-- `ProtectProc=invisible`, `NoNewPrivileges`, and the dedicated systemd user
-  reduce process/environment inspection and privilege escalation.
-
-The protection boundary is explicit:
-
-- **Web user compromised (`www-data`):** the attacker can change monitored
-  files, but must not be able to read `/etc/fim-ipl/fim.env`, `/opt/fim-ipl/data`,
-  or the FIM process environment. The daemon should continue as `fim-ipl` and
-  record the changed files.
-- **FIM user compromised:** the attacker may access the daemon's data and
-  secrets. Revoke JWT/Telegram credentials, stop the service, preserve the
-  ledger backup, and rebuild the host.
-- **Root compromised:** the attacker can read or modify every local file and
-  process. This application cannot provide a trustworthy local security
-  boundary in that situation. Recovery requires host rebuild, credential
-  rotation, firewall/egress review, EDR or other host telemetry, and an
-  off-host ledger copy.
-
-Hiding or renaming `config.json` is not a security control. File permissions,
-separate OS identities, external secrets, localhost binding, and off-host
-backups are the controls used by this deployment.
-
-## Verification
-
-```bash
-gofmt -w .
-go build ./...
-go vet ./...
-go test ./...
-go test -race ./...
-```
-
-`go test -race` requires a native Linux toolchain with CGO and GCC. A Windows
-functional check can be run directly from this repository with:
+Windows PowerShell:
 
 ```powershell
-$env:FIM_CONFIG_PATH = "C:\path\to\config.json"
+Copy-Item data/config.example.json data/config.json
+$env:FIM_CONFIG_PATH = (Resolve-Path data/config.json).Path
+$env:FIM_JWT_SECRET = 'buat-rahasia-acak-minimal-32-karakter'
+$env:FIM_ADMIN_PASSWORD = 'buat-password-admin-kuat'
 go run ./cmd/server
 ```
 
-The complete thesis demo launcher is part of the local monorepo, not this
-standalone repository: `D:\SKRIPSI\software\dev.ps1` and
-`D:\SKRIPSI\software\SIDANG_WINDOWS.md`.
+Jangan menjalankan daemon sebagai user web pada deployment produksi.
+
+## Konfigurasi dan Secret
+
+Konfigurasi non-rahasia dapat disimpan di `config.json`. Secret deployment
+sebaiknya hanya diberikan lewat environment atau systemd credentials.
+
+| Variable | Kegunaan |
+| --- | --- |
+| `FIM_CONFIG_PATH` | Lokasi file konfigurasi |
+| `FIM_SERVER_PORT` | Alamat dan port API |
+| `FIM_DB_PATH` | Lokasi database Bbolt |
+| `FIM_JWT_SECRET` | Secret signing JWT, minimal 32 karakter |
+| `FIM_ADMIN_USERNAME` | Override username Super Admin |
+| `FIM_ADMIN_PASSWORD` | Override password Super Admin |
+| `FIM_AUDITOR_USERNAME` | Override username Auditor |
+| `FIM_AUDITOR_PASSWORD` | Override password Auditor |
+| `FIM_TELEGRAM_TOKEN` | Token bot Telegram |
+| `FIM_TELEGRAM_CHAT_ID` | Tujuan chat Telegram |
+| `FIM_ALLOWED_ORIGINS` | Daftar origin CORS dipisahkan koma |
+| `FIM_STRICT_SECRETS=1` | Tolak JWT secret lemah |
+| `FIM_REQUIRE_EXTERNAL_SECRETS=1` | Tolak credential di `config.json` |
+| `FIM_REQUIRE_LOCAL_API=1` | Tolak binding API wildcard |
+
+`FIM_REQUIRE_EXTERNAL_SECRETS=1` dan `FIM_REQUIRE_LOCAL_API=1` sebaiknya selalu
+dipakai di server produksi.
+
+## Deployment Linux dengan systemd
+
+Template tersedia di `deploy/fim-ipl.service` dan contoh secret tersedia di
+`deploy/fim-ipl.env.example`.
+
+Contoh alur deployment:
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin fim-ipl
+sudo install -d -o fim-ipl -g fim-ipl -m 0700 /opt/fim-ipl/data
+sudo install -d -o root -g root -m 0700 /etc/fim-ipl
+sudo install -o root -g root -m 0600 deploy/fim-ipl.env.example /etc/fim-ipl/fim.env
+sudo install -o root -g root -m 0644 deploy/fim-ipl.service /etc/systemd/system/fim-ipl.service
+go build -o /tmp/fim-ipl ./cmd/server
+sudo install -o root -g root -m 0755 /tmp/fim-ipl /opt/fim-ipl/fim-ipl
+sudo systemctl daemon-reload
+sudo systemctl enable --now fim-ipl
+sudo systemctl status fim-ipl
+```
+
+Sebelum menjalankan, edit `/etc/fim-ipl/fim.env` dan ganti seluruh nilai
+contoh. File tersebut harus dimiliki `root:root` dengan mode `0600`.
+
+### Batas Keamanan yang Jelas
+
+- Jika user web seperti `www-data` terkena compromise, user tersebut tidak
+  boleh dapat membaca `/etc/fim-ipl/fim.env`, `/opt/fim-ipl/data`, atau proses
+  FIM. Daemon tetap berjalan sebagai `fim-ipl` dan mendeteksi perubahan webroot.
+- Jika user `fim-ipl` terkena compromise, hentikan service, cabut semua secret,
+  simpan backup ledger off-host, dan rebuild host.
+- Jika `root` terkena compromise, semua file dan proses lokal dapat dibaca atau
+  diubah. Aplikasi tidak dapat menjamin integritas lokal lagi. Lakukan rebuild
+  host, rotasi credential, review firewall/egress, dan gunakan EDR/telemetri
+  host.
+
+Menyembunyikan atau mengganti nama `config.json` bukan kontrol keamanan.
+Kontrol yang benar adalah permission, user OS terpisah, secret eksternal,
+localhost binding, dan backup off-host.
+
+## API Utama
+
+Base URL: `http://127.0.0.1:8080/api/v1`
+
+| Method | Endpoint | Keterangan |
+| --- | --- | --- |
+| GET | `/healthz` | Liveness publik |
+| POST | `/secure-gate` | Login dan JWT |
+| GET | `/dashboard/stats` | Ringkasan baseline/anomali |
+| GET | `/ledger/blocks` | Audit block terpaginasikan |
+| GET | `/ledger/verify` | Verifikasi hash-chain |
+| GET | `/ledger/export` | Export ledger JSON |
+| GET | `/metrics` | Metrik scan |
+| GET | `/events` | SSE realtime terautentikasi |
+| POST | `/baseline/init` | Buat baseline, Super Admin |
+| POST | `/baseline/update` | Perbarui baseline, Super Admin |
+| POST | `/monitoring/start` | Mulai monitoring |
+| POST | `/monitoring/stop` | Hentikan monitoring |
+| POST | `/maintenance/enable` | Jeda scan dan karantina |
+| POST | `/maintenance/disable` | Lanjutkan operasi |
+| POST | `/quarantine/release` | Release dengan audit block |
+| POST | `/backup/run` | Backup ledger manual |
+
+Semua endpoint mutasi membutuhkan Super Admin. Auditor bersifat read-only.
+
+## Simulasi Serangan
+
+Script simulasi tersedia di `scripts/` dan payloadnya sengaja jinak. Script
+tidak menjalankan RCE, tidak menghubungi C2, dan hanya membuat marker file.
+
+### Linux
+
+```bash
+scripts/attack_sim.sh /tmp/fim-test
+# jalankan POST /baseline/init setelah setup
+scripts/attack_sim.sh /tmp/fim-test --spread --count 25 --symlink
+```
+
+### Windows
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\attack_sim.ps1 -TargetDir C:\fim-test
+# jalankan POST /baseline/init setelah setup
+powershell -ExecutionPolicy Bypass -File .\scripts\attack_sim.ps1 -TargetDir C:\fim-test -Spread -Count 25
+```
+
+Skenario `--spread`/`-Spread` menguji:
+
+- backdoor di banyak folder bertingkat;
+- double extension seperti `avatar.php.jpg`;
+- `.htaccess` dan file konfigurasi tersembunyi;
+- timestamp spoofing;
+- file baru, file berubah, dan file dihapus;
+- file tidak terbaca dan symlink bila platform mengizinkan.
+
+## Simulasi Beban
+
+Generator file dummy tersedia di `scripts/gen_dummy_files.sh` dan
+`scripts/gen_dummy_files.ps1`.
+
+```bash
+scripts/gen_dummy_files.sh 10000 /tmp/fim-test/loadtest 4
+```
+
+Urutan pengujian yang benar: generate file, `baseline/init`, jalankan
+monitoring, catat endpoint `/metrics`, lalu bersihkan direktori uji. Jangan
+memasukkan file dummy ke baseline produksi.
+
+## Testing dan Quality Gate
+
+```bash
+```
+
+`go test -race` membutuhkan toolchain Linux native dengan CGO dan GCC.
+Kualitas repository dianggap siap bila seluruh command tersebut lolos.
+
+## Batasan yang Harus Dipahami
+
+- Polling tidak melihat perubahan yang terjadi dan selesai di antara dua siklus.
+- TOCTOU antara hashing dan quarantine masih mungkin pada attacker tingkat host.
+- Hardlink tidak dapat dibedakan sempurna dari file biasa oleh scanner portable.
+- Windows memakai ReadOnly best-effort, bukan permission `000` penuh.
+- Telegram memiliki retry sementara, tetapi belum memiliki outbox persisten.
+- Backup off-host wajib dipakai untuk mendeteksi penghapusan tail ledger.
