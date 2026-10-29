@@ -89,7 +89,7 @@ See `internal/api/router.go` for the complete route wiring.
 
 ## Production Deployment
 
-Use `../scripts/fim-ipl.service` as the systemd template. Run the daemon as a
+Use `deploy/fim-ipl.service` as the systemd template. Run the daemon as a
 dedicated `fim-ipl` user, never as `www-data` or the web application user.
 Keep `/etc/fim-ipl/fim.env` owned by `root:root` with mode `0600`, use
 `FIM_STRICT_SECRETS=1`, and keep the ledger/config directory inaccessible to
@@ -108,6 +108,28 @@ FIM_TELEGRAM_CHAT_ID=replace-with-a-chat-id
 If the web application and the FIM daemon run as the same OS user, a web
 compromise can read the daemon's secrets and ledger. Separate OS identities
 are therefore a security requirement, not an optional optimization.
+
+### Web compromise threat model
+
+If an attacker uploads a file manager or obtains a remote shell as `www-data`,
+assume they can read everything owned/readable by `www-data`. There is no
+reliable "hidden config" technique that defeats a user who already has those
+permissions. The deployment boundary must therefore be:
+
+- Web files are readable by the FIM user, but `/opt/fim-ipl/data` is not
+  readable by `www-data`.
+- Secrets are loaded from `/etc/fim-ipl/fim.env` or systemd credentials, not
+  from the project directory or webroot.
+- `FIM_REQUIRE_EXTERNAL_SECRETS=1` rejects credentials in `config.json`.
+- `FIM_REQUIRE_LOCAL_API=1` rejects wildcard API binding. Put Nginx/Caddy in
+  front if remote operator access is needed.
+- `ProtectProc=invisible`, `NoNewPrivileges`, and the dedicated systemd user
+  reduce process/environment inspection and privilege escalation.
+
+If the attacker becomes `root`, or compromises the FIM service user itself,
+the host is already outside the protection boundary. Use host hardening,
+EDR, egress controls, off-host ledger backups, and rapid secret rotation for
+that case. Renaming or hiding a file does not solve a root-level compromise.
 
 ## Verification
 

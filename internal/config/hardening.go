@@ -75,3 +75,44 @@ func checkSecrets(c *Config) error {
 	log.Println(msg)
 	return nil
 }
+
+// checkExternalSecrets memastikan file konfigurasi yang berada di disk tidak
+// menjadi tempat penyimpanan credential deployment. Menyembunyikan nama file
+// tidak membantu bila attacker sudah mendapat shell; memindahkan secret ke
+// environment/secret manager dan memisahkan user OS-lah yang memberi batas.
+func checkExternalSecrets(c *Config) error {
+	if os.Getenv("FIM_REQUIRE_EXTERNAL_SECRETS") != "1" {
+		return nil
+	}
+	var fields []string
+	if c.JWTSecret != "" {
+		fields = append(fields, "jwt_secret")
+	}
+	if c.AdminPassword != "" {
+		fields = append(fields, "admin_password")
+	}
+	if c.AuditorPassword != "" {
+		fields = append(fields, "auditor_password")
+	}
+	if c.TelegramToken != "" {
+		fields = append(fields, "telegram_token")
+	}
+	if c.TelegramChatID != "" {
+		fields = append(fields, "telegram_chat_id")
+	}
+	if len(fields) > 0 {
+		return fmt.Errorf("credential fields in config.json are forbidden when FIM_REQUIRE_EXTERNAL_SECRETS=1: %s; use environment/secret manager", strings.Join(fields, ", "))
+	}
+	return nil
+}
+
+func checkLocalAPI(c *Config) error {
+	if os.Getenv("FIM_REQUIRE_LOCAL_API") != "1" {
+		return nil
+	}
+	address := strings.ToLower(strings.TrimSpace(c.ServerPort))
+	if strings.HasPrefix(address, "127.0.0.1:") || strings.HasPrefix(address, "localhost:") || strings.HasPrefix(address, "[::1]:") {
+		return nil
+	}
+	return fmt.Errorf("server_port must bind to localhost when FIM_REQUIRE_LOCAL_API=1; got %q", c.ServerPort)
+}

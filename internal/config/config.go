@@ -81,6 +81,9 @@ func Load(path string) (*Config, error) {
 			if secretErr := checkSecrets(instance); secretErr != nil && err == nil {
 				err = secretErr
 			}
+			if deploymentErr := checkLocalAPI(instance); deploymentErr != nil && err == nil {
+				err = deploymentErr
+			}
 			return
 		}
 
@@ -115,6 +118,12 @@ func Load(path string) (*Config, error) {
 
 		applyEnvOverrides(instance)
 		err = checkSecrets(instance)
+		if err == nil {
+			err = checkExternalSecrets(instance)
+		}
+		if err == nil {
+			err = checkLocalAPI(instance)
+		}
 	})
 
 	return instance, err

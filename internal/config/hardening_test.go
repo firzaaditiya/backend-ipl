@@ -56,3 +56,33 @@ func TestHardenFileModeTightensGroupWorldBits(t *testing.T) {
 		t.Fatalf("izin = %o, want 600", info.Mode().Perm())
 	}
 }
+
+func TestCheckExternalSecretsRejectsDiskCredentials(t *testing.T) {
+	t.Setenv("FIM_REQUIRE_EXTERNAL_SECRETS", "1")
+	c := &Config{
+		JWTSecret:      "disk-secret",
+		AdminPassword:  "bcrypt-hash",
+		TelegramToken:  "bot-token",
+		TelegramChatID: "123",
+	}
+	if err := checkExternalSecrets(c); err == nil {
+		t.Fatal("credential di config harus ditolak dalam mode external secrets")
+	}
+}
+
+func TestCheckExternalSecretsAllowsEmptyDiskConfig(t *testing.T) {
+	t.Setenv("FIM_REQUIRE_EXTERNAL_SECRETS", "1")
+	if err := checkExternalSecrets(&Config{}); err != nil {
+		t.Fatalf("config kosong seharusnya diizinkan: %v", err)
+	}
+}
+
+func TestCheckLocalAPI(t *testing.T) {
+	t.Setenv("FIM_REQUIRE_LOCAL_API", "1")
+	if err := checkLocalAPI(&Config{ServerPort: "127.0.0.1:8080"}); err != nil {
+		t.Fatalf("localhost API ditolak: %v", err)
+	}
+	if err := checkLocalAPI(&Config{ServerPort: ":8080"}); err == nil {
+		t.Fatal("API wildcard harus ditolak dalam mode local-only")
+	}
+}
