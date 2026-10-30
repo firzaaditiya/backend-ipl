@@ -156,6 +156,47 @@ func TestQuarantineStateHelpers(t *testing.T) {
 	}
 }
 
+func TestQuarantinedFiles(t *testing.T) {
+	l := newTestLedger(t)
+
+	if _, err := l.AppendBlock(event("/var/www/a.php", models.ActionCreated, "", "h1", true)); err != nil {
+		t.Fatalf("append a: %v", err)
+	}
+	if err := l.RecordQuarantineMode("/var/www/a.php", 0o640); err != nil {
+		t.Fatalf("record mode a: %v", err)
+	}
+	if _, err := l.AppendBlock(event("/var/www/b.php", models.ActionCreated, "", "h2", true)); err != nil {
+		t.Fatalf("append b: %v", err)
+	}
+	// b.php dikarantina sebelum pencatatan izin (tanpa RecordQuarantineMode):
+	// daftar tetap memuatnya, dengan OriginalMode nil.
+	files, err := l.QuarantinedFiles()
+	if err != nil {
+		t.Fatalf("QuarantinedFiles: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("expected 2 quarantined files, got %d", len(files))
+	}
+	if files[0].FilePath != "/var/www/a.php" || files[1].FilePath != "/var/www/b.php" {
+		t.Fatalf("expected sorted paths a,b, got %+v", files)
+	}
+	if files[0].OriginalMode == nil || *files[0].OriginalMode != 0o640 {
+		t.Fatalf("expected a.php original mode 0640, got %+v", files[0])
+	}
+	if files[1].OriginalMode != nil {
+		t.Fatalf("expected b.php original mode nil, got %+v", files[1])
+	}
+
+	// Setelah RELEASED, a.php keluar dari daftar.
+	if _, err := l.AppendBlock(event("/var/www/a.php", models.ActionReleased, "", "", false)); err != nil {
+		t.Fatalf("append released: %v", err)
+	}
+	files, _ = l.QuarantinedFiles()
+	if len(files) != 1 || files[0].FilePath != "/var/www/b.php" {
+		t.Fatalf("expected only b.php quarantined, got %+v", files)
+	}
+}
+
 func TestMetricsRetentionCap(t *testing.T) {
 	l := newTestLedger(t)
 	l.maxMetricEntries = 3

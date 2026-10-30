@@ -172,6 +172,19 @@ interval yang dikonfigurasi. Hitung mundur ini bernilai kosong (bukan
 tebakan) bila pemantauan berhenti, mode pemeliharaan aktif, atau belum ada
 siklus yang tercatat.
 
+## Daftar karantina saat ini (v1.3.0)
+
+Sejak v1.3.0, endpoint baca `GET /api/v1/quarantine/list` mengembalikan
+berkas yang status TERAKHIR-nya masih dikarantina, beserta izin asli yang
+akan dipulihkan dan izin berkas saat ini di disk. Sebelumnya operator
+harus memburu blok terakhir di Audit Trail untuk mengetahui apa saja yang
+sedang diisolasi; sekarang dasbor menampilkan daftar itu langsung, dan
+pelepasan dapat dilakukan dari dasbor maupun dari Audit Trail. Respons
+pelepasan kini juga memuat `restored_mode` sebagai field terpisah, agar
+antarmuka tidak lagi menampilkan angka izin yang ditebak (sebelumnya
+pesan sukses di Audit Trail selalu menulis 0644, padahal izin yang
+dipulihkan bisa 0600 atau 0640).
+
 ## Latensi deteksi: polling, bukan real-time
 
 Deteksi berjalan per siklus polling (`filepath.Walk` + `time.Ticker`,

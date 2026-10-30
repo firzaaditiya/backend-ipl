@@ -17,7 +17,7 @@ import (
 // 1.2.0 = karantina dan pelepasan diverifikasi ulang dengan membaca kembali
 // izin berkas (bukan hanya dari galat chmod), dan dasbor menampilkan hitung
 // mundur pemindaian berikutnya agar polling deterministik dapat diamati.
-const AppVersion = "1.2.0"
+const AppVersion = "1.3.0"
 
 // SystemHandler menyajikan informasi runtime yang aman untuk ditampilkan di UI.
 // Tidak ada secret, path data, atau kredensial yang dikembalikan.

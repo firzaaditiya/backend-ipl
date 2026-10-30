@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -412,6 +413,37 @@ func (l *Ledger) GetAnomalyCount() (int, error) {
 		})
 	})
 	return count, err
+}
+
+// QuarantinedFile adalah satu berkas yang status TERAKHIR-nya masih
+// dikarantina, beserta izin aslinya bila tercatat (nil bila berkas
+// dikarantina sebelum pencatatan izin ada, sejak v1.1.0).
+// Dipakai endpoint daftar karantina (v1.3.0) agar operator tidak perlu
+// memburu blok terakhir di Audit Trail untuk mengetahui apa saja yang
+// sedang diisolasi dan izin apa yang akan dipulihkan saat pelepasan.
+type QuarantinedFile struct {
+	FilePath     string  `json:"file_path"`
+	OriginalMode *uint32 `json:"original_mode"`
+}
+
+// QuarantinedFiles mengembalikan daftar berkas yang sedang dikarantina,
+// terurut menurut path agar tampilannya stabil di dasbor.
+func (l *Ledger) QuarantinedFiles() ([]QuarantinedFile, error) {
+	paths, err := l.GetCurrentlyQuarantinedPaths()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]QuarantinedFile, 0, len(paths))
+	for path := range paths {
+		entry := QuarantinedFile{FilePath: path}
+		if mode, found, err := l.GetQuarantineMode(path); err == nil && found {
+			m := mode
+			entry.OriginalMode = &m
+		}
+		out = append(out, entry)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].FilePath < out[j].FilePath })
+	return out, nil
 }
 
 // GetCurrentlyQuarantinedPaths mengembalikan path yang status TERAKHIR-nya

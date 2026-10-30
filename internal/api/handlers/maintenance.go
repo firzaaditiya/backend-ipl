@@ -176,8 +176,53 @@ func (h *QuarantineHandler) Release(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message":           fmt.Sprintf("file permission restored to %04o", restoreMode),
+		"restored_mode":     fmt.Sprintf("%04o", restoreMode),
 		"restored_original": restoredOriginal,
 		"audited":           audited,
+	})
+}
+
+// ListQuarantined mengembalikan berkas yang status TERAKHIR-nya masih
+// dikarantina, beserta izin asli yang akan dipulihkan dan izin berkas
+// saat ini di disk. Endpoint ini hanya membaca (Auditor boleh memakainya),
+// sehingga operator dapat melihat apa yang sedang diisolasi tanpa memburu
+// blok terakhir di Audit Trail. Bila berkas sudah tidak ada di disk,
+// exists=false dan current_mode kosong, yang menandakan pelepasan tidak
+// lagi relevan dan penghapusan dari baseline akan ditangani siklus
+// pemindaian berikutnya sebagai DELETED.
+func (h *QuarantineHandler) ListQuarantined(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	files, err := h.ledger.QuarantinedFiles()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list quarantined files"})
+		return
+	}
+	type item struct {
+		FilePath     string  `json:"file_path"`
+		OriginalMode *string `json:"original_mode"`
+		CurrentMode  *string `json:"current_mode"`
+		Exists       bool    `json:"exists"`
+	}
+	out := make([]item, 0, len(files))
+	for _, f := range files {
+		it := item{FilePath: f.FilePath}
+		if f.OriginalMode != nil {
+			m := fmt.Sprintf("%04o", *f.OriginalMode)
+			it.OriginalMode = &m
+		}
+		if info, err := os.Stat(f.FilePath); err == nil {
+			it.Exists = true
+			m := fmt.Sprintf("%04o", info.Mode().Perm())
+			it.CurrentMode = &m
+		}
+		out = append(out, it)
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"files": out,
+		"count": len(out),
 	})
 }
 

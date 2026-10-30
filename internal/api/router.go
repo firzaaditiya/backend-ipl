@@ -229,6 +229,9 @@ func NewRouter(
 			}
 			maintHandler.UpdateBaseline(w, r)
 
+		case path == "/api/v1/quarantine/list":
+			quarantineHandler.ListQuarantined(w, r)
+
 		case path == "/api/v1/quarantine/release":
 			if forbidAuditor() {
 				return
