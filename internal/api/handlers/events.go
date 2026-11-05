@@ -20,8 +20,9 @@ const (
 )
 
 // EventsHandler menyajikan stream Server-Sent Events untuk pembaruan
-// dashboard secara realtime. Autentikasi tetap memakai bearer token karena
-// klien membaca stream lewat fetch(), bukan EventSource bawaan browser.
+// dashboard secara realtime. Autentikasi memakai cookie sesi HttpOnly yang
+// sama seperti endpoint lain (diperiksa router sebelum handler ini
+// dipanggil); header Authorization tidak diterima di mana pun.
 type EventsHandler struct {
 	hub     *realtime.Hub
 	scanner *scanner.Scanner

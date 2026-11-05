@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"errors"
 	"log"
 	"sort"
 	"sync"
@@ -15,14 +16,27 @@ type CompareResult struct {
 	Unreadable []models.AnomalyEvent
 }
 
-func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]models.FileRecord) *CompareResult {
+// CompareWithBaseline membandingkan hasil scan dengan baseline. workers
+// adalah jumlah goroutine pembanding (<= 0 berarti default 4); nilai ini
+// berasal dari konfigurasi scanner agar konsisten dengan worker hashing.
+func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]models.FileRecord, workers int) *CompareResult {
+	if workers <= 0 {
+		workers = 4
+	}
 	result := &CompareResult{}
 	var mu sync.Mutex
 
 	scannedMap := make(map[string]models.ScanResult, len(scanResults))
 	errorMap := make(map[string]models.ScanResult)
+	skippedMap := make(map[string]models.ScanResult)
 	for _, sr := range scanResults {
 		if sr.Err != nil {
+			// File yang dilewati karena batas ukuran tetap ada di disk:
+			// jangan laporkan sebagai DELETED maupun UNREADABLE.
+			if errors.Is(sr.Err, ErrFileOversize) {
+				skippedMap[sr.Path] = sr
+				continue
+			}
 			errorMap[sr.Path] = sr
 			continue
 		}
@@ -32,7 +46,7 @@ func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]mo
 	var wg sync.WaitGroup
 	baselineChan := make(chan models.FileRecord, 100)
 
-	for i := 0; i < 4; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -45,6 +59,11 @@ func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]mo
 					}()
 					scanned, exists := scannedMap[record.Path]
 					if !exists {
+						if _, skipped := skippedMap[record.Path]; skipped {
+							// File ada tetapi tidak di-hash karena batas
+							// ukuran: bukan DELETED, bukan UNREADABLE.
+							return
+						}
 						if failed, unreadable := errorMap[record.Path]; unreadable {
 							// Jangan pernah menganggap file yang gagal dibaca
 							// sebagai DELETED: itu akan menghapus baseline dan

@@ -60,6 +60,32 @@ func TestIsPathWithinRoots(t *testing.T) {
 	if isPathWithinRoots([]string{root}, root+"-evil/x.php") {
 		t.Fatal("expected sibling directory with similar prefix to be rejected")
 	}
+
+	// Direktori symlink di dalam root yang mengarah ke luar harus ditolak.
+	outsideDir := t.TempDir()
+	secret := filepath.Join(outsideDir, "secret.txt")
+	if err := os.WriteFile(secret, []byte("s"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	link := filepath.Join(insideDir, "link")
+	if err := os.Symlink(outsideDir, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if isPathWithinRoots([]string{root}, filepath.Join(link, "secret.txt")) {
+		t.Fatal("expected path through a symlink escaping the root to be rejected")
+	}
+	// Symlink yang tetap di dalam root tetap diizinkan.
+	innerTarget := filepath.Join(insideDir, "real.txt")
+	if err := os.WriteFile(innerTarget, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	innerLink := filepath.Join(insideDir, "inner-link.txt")
+	if err := os.Symlink(innerTarget, innerLink); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if !isPathWithinRoots([]string{root}, innerLink) {
+		t.Fatal("expected symlink staying inside the root to be allowed")
+	}
 }
 
 func TestValidateWebhookURL(t *testing.T) {
@@ -87,6 +113,9 @@ func TestValidateWebhookURL(t *testing.T) {
 		"http://169.254.169.254/latest/meta-data",
 		"http://0.0.0.0/hook",
 		"http://[::1]/hook",
+		"http://100.64.0.1/hook",
+		"http://192.0.0.170/hook",
+		"http://198.18.0.1/hook",
 	}
 	for _, u := range invalid {
 		if err := validateWebhookURL(u); err == nil {

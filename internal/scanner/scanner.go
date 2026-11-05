@@ -85,6 +85,13 @@ func HashFile(path string) (string, error) {
 
 const maxScanFileSize = 50 * 1024 * 1024
 
+// ErrFileOversize menandai file non-kode yang dilewati karena melebihi
+// batas pindai. File seperti ini TIDAK di-hash, tetapi juga TIDAK boleh
+// dilaporkan DELETED bila sebelumnya ada di baseline (lihat
+// CompareWithBaseline): file-nya masih ada, hanya tidak diperiksa isinya.
+// Batasan ini didokumentasikan di README sebagai keterbatasan yang diketahui.
+var ErrFileOversize = errors.New("file melebihi batas pindai 50 MB (non-kode); tidak di-hash")
+
 // CollectFiles mengembalikan path file yang akan di-hash. File yang tidak
 // dapat dibaca atau berupa symlink TIDAK diikuti; keduanya dikembalikan oleh
 // collectFiles sebagai hasil ber-error agar bisa dilaporkan sebagai
@@ -140,8 +147,14 @@ func (s *Scanner) collectFiles() ([]string, []models.ScanResult, error) {
 			}
 			// Batas ukuran mencegah file raksasa (video/backup) membebani I/O.
 			// File kode tetap dipindai berapa pun ukurannya karena merupakan
-			// target utama webshell/backdoor.
+			// target utama webshell/backdoor. File non-kode yang melebihi
+			// batas dikembalikan sebagai hasil ber-error ErrFileOversize
+			// agar CompareWithBaseline tidak menganggapnya DELETED.
 			if info.Size() > maxScanFileSize && !isCodeLike(path) {
+				rejected = append(rejected, models.ScanResult{
+					Path: path,
+					Err:  fmt.Errorf("%w (%d byte)", ErrFileOversize, info.Size()),
+				})
 				return nil
 			}
 			files = append(files, path)
@@ -254,6 +267,16 @@ func (s *Scanner) worker(jobs <-chan string, results chan<- models.ScanResult, w
 	}
 }
 
+// WorkerCount mengembalikan jumlah worker hashing yang dikonfigurasi.
+// Dipakai main.go agar paralelisme perbandingan baseline memakai nilai yang
+// sama (sebelum v1.4.0, CompareWithBaseline memakai 4 goroutine secara
+// hardcode dan mengabaikan konfigurasi ini).
+func (s *Scanner) WorkerCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.workerCount
+}
+
 func (s *Scanner) IsRunning() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -287,8 +310,11 @@ func (s *Scanner) FinishScan() {
 }
 
 func (s *Scanner) StartMonitoring(intervalSec int) {
+	// Interval di bawah minimum dijepit ke minimum (30 detik), bukan ke
+	// default 300 detik: diam-diam memakai 300 saat admin meminta 30
+	// adalah perilaku yang menyesatkan (diperbaiki di v1.4.0).
 	if intervalSec < minIntervalSec {
-		intervalSec = defaultIntervalSec
+		intervalSec = minIntervalSec
 	}
 	if intervalSec > maxIntervalSec {
 		intervalSec = maxIntervalSec

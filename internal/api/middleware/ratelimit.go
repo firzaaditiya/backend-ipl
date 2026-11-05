@@ -13,7 +13,10 @@ import (
 )
 
 // trustProxy hanya aktif jika FIM_TRUST_PROXY=1. Tanpa ini, header
-// X-Forwarded-For / X-Real-IP dapat dipalsukan klien untuk melewati limit.
+// X-Forwarded-For / X-Real-IP / CF-Connecting-IP dapat dipalsukan klien
+// untuk melewati limit. Aktifkan hanya bila backend hanya terjangkau lewat
+// reverse proxy tepercaya (di deployment ini: Nginx yang hanya menerima
+// trafik dari Cloudflare Tunnel).
 var trustProxy = os.Getenv("FIM_TRUST_PROXY") == "1"
 
 // bucket adalah token-bucket sederhana per IP.
@@ -121,8 +124,22 @@ func ClientIP(r *http.Request) string {
 }
 
 // clientIP mengekstraksi IP klien dengan preferensi header proxy standar.
+//
+// Urutan saat trustProxy aktif:
+//  1. CF-Connecting-IP — ditulis ulang oleh edge Cloudflare menjadi IP klien
+//     asli, jadi tidak dapat dipalsukan lewat Tunnel. Di deployment ini
+//     semua trafik publik datang lewat Cloudflare Tunnel, sehingga ini
+//     sumber paling tepercaya. Nginx meneruskan header ini apa adanya
+//     (jangan menimpanya).
+//  2. X-Forwarded-For paling kiri — dipakai bila CF-Connecting-IP tidak ada
+//     (mis. akses langsung/lokal). Aman hanya karena Nginx MENIMPA header
+//     ini dengan $remote_addr, bukan meng-append.
+//  3. X-Real-IP, lalu RemoteAddr.
 func clientIP(r *http.Request) string {
 	if trustProxy {
+		if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cf != "" {
+			return cf
+		}
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			// Ambil IP paling kiri (client asli).
 			if idx := strings.Index(xff, ","); idx > 0 {

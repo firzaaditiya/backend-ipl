@@ -16,12 +16,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/skripsi/fim-ipl/internal/ledger"
+	"github.com/skripsi/fim-ipl/internal/netguard"
 	"github.com/skripsi/fim-ipl/internal/notifier"
 )
 
@@ -38,6 +40,12 @@ type Manager struct {
 	closed     bool
 	lastRunAt  time.Time
 	httpClient *http.Client
+
+	// allowLocalWebhook HANYA untuk pengujian (di-set langsung oleh test
+	// dalam paket ini): mengizinkan webhook ke 127.0.0.1 agar httptest bisa
+	// dipakai. Tidak ada jalur konfigurasi/env yang mengaktifkannya, jadi
+	// produksi selalu memvalidasi target webhook sebagai alamat publik.
+	allowLocalWebhook bool
 
 	// runMu menyerialkan seluruh eksekusi backup. Tanpa ini, backup manual,
 	// backup terjadwal, dan backup anomali kritis dapat berjalan bersamaan dan
@@ -57,8 +65,52 @@ func NewManager(l *ledger.Ledger, tg *notifier.Telegram, webhookURL string, inte
 		telegram:   tg,
 		webhookURL: webhookURL,
 		interval:   interval,
-		httpClient: &http.Client{Timeout: 20 * time.Second},
+		httpClient: newWebhookClient(),
 	}
+}
+
+// newWebhookClient membuat HTTP client khusus webhook: tidak mengikuti
+// redirect apa pun (redirect 307/308 dapat meneruskan body export ledger ke
+// host lain), dan DialContext-nya menolak alamat non-publik pada saat koneksi
+// dibuat — validasi saat penyimpanan saja tidak cukup karena DNS dapat
+// berubah (rebinding) setelah URL disimpan.
+func newWebhookClient() *http.Client {
+	transport := &http.Transport{
+		DialContext: guardedDialContext,
+	}
+	return &http.Client{
+		Timeout: 20 * time.Second,
+		// Tolak semua redirect: respons 3xx dikembalikan apa adanya dan
+		// postWebhook mengubahnya menjadi error (lihat di bawah).
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: transport,
+	}
+}
+
+func guardedDialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if netguard.IsInternalIP(ip) {
+			return nil, fmt.Errorf("webhook dial to non-public address %q refused", host)
+		}
+	} else {
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+		if err != nil {
+			return nil, err
+		}
+		for _, ip := range ips {
+			if netguard.IsInternalIP(ip) {
+				return nil, fmt.Errorf("webhook host %q resolves to non-public address", host)
+			}
+		}
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, network, address)
 }
 
 // Start menjalankan scheduler backup di goroutine terpisah. Aman dipanggil
@@ -215,6 +267,15 @@ func formatCaption(label, filename string, exp *ledger.LedgerExport) string {
 }
 
 func (m *Manager) postWebhook(url, filename string, payload []byte) error {
+	// Validasi ulang sesaat sebelum pengiriman: URL yang lolos saat
+	// disimpan dapat berubah menjadi internal bila DNS-nya di-rebind.
+	// (allowLocalWebhook hanya di-set oleh pengujian dalam paket ini.)
+	if !m.allowLocalWebhook {
+		if err := netguard.ValidatePublicURL(url); err != nil {
+			return err
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -225,12 +286,17 @@ func (m *Manager) postWebhook(url, filename string, payload []byte) error {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-FIM-IPL-File", filename)
 
-	resp, err := m.httpClient.Do(req)
+	resp, err := m.webhookClient().Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
+	// Redirect tidak diikuti (lihat newWebhookClient): respons 3xx di sini
+	// berarti target mencoba mengalihkan export ledger ke host lain.
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return fmt.Errorf("webhook redirect not allowed (status %d)", resp.StatusCode)
+	}
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("webhook returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
@@ -239,6 +305,23 @@ func (m *Manager) postWebhook(url, filename string, payload []byte) error {
 	// Baca body agar koneksi dapat dipakai ulang (connection reuse).
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	return nil
+}
+
+// webhookClient mengembalikan client yang dipakai postWebhook. Bila
+// allowLocalWebhook aktif (hanya pengujian dalam paket ini, httptest di
+// 127.0.0.1), dipakai client tanpa dial guard — kalau tidak, guard akan
+// menolak koneksi test itu sendiri. Produksi selalu memakai m.httpClient
+// (dial guard + tolak redirect).
+func (m *Manager) webhookClient() *http.Client {
+	if m.allowLocalWebhook {
+		return &http.Client{
+			Timeout: 20 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+	}
+	return m.httpClient
 }
 
 func verifyLabel(valid bool) string {

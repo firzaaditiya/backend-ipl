@@ -6,6 +6,8 @@ import (
 	"os"
 	"runtime"
 	"strings"
+
+	"github.com/skripsi/fim-ipl/internal/netguard"
 )
 
 // Ancaman yang ditangani di file ini: aplikasi berjalan di VPS yang sama dengan
@@ -23,6 +25,9 @@ var knownWeakSecrets = []string{
 	"change-this-secret-in-production",
 	"secret",
 	"changeme",
+	// Nilai fallback lama generateRandomSecret (dihapus di v1.4.0): tetap
+	// ditolak sebagai jaring pengaman bila config lama masih memakainya.
+	"fallback-secret-change-me-immediately",
 }
 
 // hardenFileMode mempersempit izin file config/DB di Unix menjadi 0600 bila
@@ -132,4 +137,18 @@ func checkLocalAPI(c *Config) error {
 		return nil
 	}
 	return fmt.Errorf("server_port must bind to localhost when FIM_REQUIRE_LOCAL_API=1; got %q", c.ServerPort)
+}
+
+// checkWebhookURL menolak URL webhook backup yang mengarah ke jaringan
+// internal, baik dari config.json maupun dari environment. Validasi yang
+// sama juga berjalan di Settings API saat URL disimpan dan di backup
+// manager sesaat sebelum pengiriman.
+func checkWebhookURL(c *Config) error {
+	if c.BackupWebhookURL == "" {
+		return nil
+	}
+	if err := netguard.ValidatePublicURL(c.BackupWebhookURL); err != nil {
+		return fmt.Errorf("backup_webhook_url tidak valid: %w", err)
+	}
+	return nil
 }

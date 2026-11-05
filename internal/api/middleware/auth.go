@@ -66,10 +66,13 @@ func ClearSessionCookie(w http.ResponseWriter, secure bool) {
 type Claims struct {
 	Username string `json:"username"`
 	Role     string `json:"role"`
+	// SessionEpoch adalah versi sesi saat token diterbitkan. Token dari
+	// epoch lama ditolak setelah kredensial diubah (lihat Config.SessionEpoch).
+	SessionEpoch int `json:"session_epoch"`
 	jwt.RegisteredClaims
 }
 
-func ParseClaims(r *http.Request, secret string) (*Claims, bool) {
+func ParseClaims(r *http.Request, secret string, epoch int) (*Claims, bool) {
 	cookie, err := r.Cookie(SessionCookieName)
 	if err != nil || cookie.Value == "" {
 		return nil, false
@@ -99,18 +102,24 @@ func ParseClaims(r *http.Request, secret string) (*Claims, bool) {
 	if claims.Role != RoleSuperAdmin && claims.Role != RoleAuditor {
 		return nil, false
 	}
+	// Token yang diterbitkan sebelum kredensial terakhir diubah tidak
+	// berlaku lagi. Token lama (sebelum v1.4.0, tanpa klaim epoch) terbaca
+	// sebagai epoch 0 dan tetap diterima selama epoch saat ini masih 0.
+	if epoch >= 0 && claims.SessionEpoch != epoch {
+		return nil, false
+	}
 	return claims, true
 }
 
-func ValidateRequest(r *http.Request, secret string) bool {
-	_, ok := ParseClaims(r, secret)
+func ValidateRequest(r *http.Request, secret string, epoch int) bool {
+	_, ok := ParseClaims(r, secret, epoch)
 	return ok
 }
 
-func JWTAuth(secret string) func(http.Handler) http.Handler {
+func JWTAuth(secret string, epoch int) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !ValidateRequest(r, secret) {
+			if !ValidateRequest(r, secret, epoch) {
 				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 				return
 			}
@@ -119,7 +128,7 @@ func JWTAuth(secret string) func(http.Handler) http.Handler {
 	}
 }
 
-func GenerateToken(username, role, secret string, expireHours int) (string, time.Time, error) {
+func GenerateToken(username, role, secret string, expireHours int, epoch int) (string, time.Time, error) {
 	expiresAt := time.Now().Add(time.Duration(expireHours) * time.Hour)
 
 	// Fail-closed: role harus eksplisit dan valid.
@@ -128,8 +137,9 @@ func GenerateToken(username, role, secret string, expireHours int) (string, time
 	}
 
 	claims := &Claims{
-		Username: username,
-		Role:     role,
+		Username:     username,
+		Role:         role,
+		SessionEpoch: epoch,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(expiresAt),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),

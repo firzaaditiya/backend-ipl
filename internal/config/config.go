@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -35,6 +37,14 @@ type Config struct {
 	// tidak dianggap sebagai perintah stop oleh admin.
 	MonitoringEnabled bool `json:"monitoring_enabled"`
 
+	// SessionEpoch adalah versi sesi: setiap perubahan kredensial
+	// (SetupPassword / SetupAuditor) menaikkannya satu tingkat, sehingga
+	// seluruh token JWT yang diterbitkan sebelumnya ditolak. Logout sendiri
+	// TIDAK mencabut token di sisi server (token tetap valid sampai
+	// kedaluwarsa 24 jam atau sampai kredensial diubah); ini batasan yang
+	// dinyatakan di README, bukan celah yang disembunyikan.
+	SessionEpoch int `json:"session_epoch"`
+
 	AdminUsername string `json:"admin_username"`
 	AdminPassword string `json:"admin_password"`
 
@@ -53,10 +63,10 @@ type Config struct {
 	BackupWebhookURL string `json:"backup_webhook_url"`
 
 	// AllowedOrigins membatasi CORS sekaligus menjadi daftar origin yang
-	// diizinkan pada pemeriksaan CSRF untuk request mutasi. Kosong =
-	// izinkan semua origin (perilaku lama, TIDAK disarankan bila auth
-	// sudah memakai cookie, karena pemeriksaan Origin ikut dinonaktifkan).
-	// Produksi wajib mengisinya dengan origin dashboard, mis.
+	// diizinkan pada pemeriksaan CSRF untuk request mutasi. Kosong berarti
+	// TIDAK ada origin lintas situs yang diizinkan: header CORS tidak
+	// dikirim, dan mutasi dengan Origin yang berbeda dari Host request
+	// ditolak. Produksi wajib mengisinya dengan origin dashboard, mis.
 	// https://fim.tpqalfawwaz.web.id.
 	AllowedOrigins []string `json:"allowed_origins"`
 
@@ -94,11 +104,19 @@ func Load(path string) (*Config, error) {
 
 		data, readErr := os.ReadFile(path)
 		if readErr != nil {
-			instance.JWTSecret = generateRandomSecret()
+			secret, secretErr := generateRandomSecret()
+			if secretErr != nil {
+				err = secretErr
+				return
+			}
+			instance.JWTSecret = secret
 			err = Save(path, instance)
 			applyEnvOverrides(instance)
 			if secretErr := checkSecrets(instance); secretErr != nil && err == nil {
 				err = secretErr
+			}
+			if webhookErr := checkWebhookURL(instance); webhookErr != nil && err == nil {
+				err = webhookErr
 			}
 			if deploymentErr := checkLocalAPI(instance); deploymentErr != nil && err == nil {
 				err = deploymentErr
@@ -128,7 +146,12 @@ func Load(path string) (*Config, error) {
 			changed = true
 		}
 		if instance.JWTSecret == "" {
-			instance.JWTSecret = generateRandomSecret()
+			secret, secretErr := generateRandomSecret()
+			if secretErr != nil {
+				err = secretErr
+				return
+			}
+			instance.JWTSecret = secret
 			changed = true
 		}
 		// Migrasi cookie_secure: config yang dibuat sebelum v1.1.0 tidak
@@ -144,6 +167,9 @@ func Load(path string) (*Config, error) {
 
 		applyEnvOverrides(instance)
 		err = checkSecrets(instance)
+		if err == nil {
+			err = checkWebhookURL(instance)
+		}
 		if err == nil {
 			err = checkExternalSecrets(instance)
 		}
@@ -166,8 +192,13 @@ func Load(path string) (*Config, error) {
 //	FIM_ADMIN_USERNAME, FIM_ADMIN_PASSWORD,
 //	FIM_AUDITOR_USERNAME, FIM_AUDITOR_PASSWORD,
 //	FIM_TELEGRAM_TOKEN, FIM_TELEGRAM_CHAT_ID,
+//	FIM_BACKUP_WEBHOOK_URL,
+//	FIM_SCAN_INTERVAL_SEC (30-86400), FIM_WORKER_COUNT (1-16),
 //	FIM_ALLOWED_ORIGINS (dipisah koma),
 //	FIM_COOKIE_SECURE ("1"/"true" atau "0"/"false")
+//
+// Yang TIDAK punya env override dan hanya diatur lewat config.json atau
+// Settings API: watch_paths dan login_path.
 func applyEnvOverrides(c *Config) {
 	if v := os.Getenv("FIM_SERVER_PORT"); v != "" {
 		c.ServerPort = v
@@ -215,6 +246,22 @@ func applyEnvOverrides(c *Config) {
 		c.TelegramChatID = v
 		markEnv(c, "telegram_chat_id")
 	}
+	if v := os.Getenv("FIM_BACKUP_WEBHOOK_URL"); v != "" {
+		c.BackupWebhookURL = v
+		markEnv(c, "backup_webhook_url")
+	}
+	if v := os.Getenv("FIM_SCAN_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 30 && n <= 86400 {
+			c.ScanIntervalSec = n
+			markEnv(c, "scan_interval_sec")
+		}
+	}
+	if v := os.Getenv("FIM_WORKER_COUNT"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 1 && n <= 16 {
+			c.WorkerCount = n
+			markEnv(c, "worker_count")
+		}
+	}
 	if v := os.Getenv("FIM_ALLOWED_ORIGINS"); v != "" {
 		origins := make([]string, 0, 4)
 		for _, raw := range strings.Split(v, ",") {
@@ -243,12 +290,15 @@ func hashForMemory(value string) string {
 	return value
 }
 
-func generateRandomSecret() string {
+func generateRandomSecret() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
-		return "fallback-secret-change-me-immediately"
+		// Fail-closed: tidak ada nilai fallback yang dapat ditebak. Bila
+		// generator acak OS gagal, daemon tidak boleh boot dengan secret
+		// yang dikenal publik.
+		return "", fmt.Errorf("cannot generate random JWT secret: %w", err)
 	}
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(b), nil
 }
 
 func Get() *Config {
@@ -331,6 +381,12 @@ func (c *Config) Update(fn func(*Config)) {
 	fn(c)
 }
 
+func (c *Config) GetSessionEpoch() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.SessionEpoch
+}
+
 func (c *Config) GetWatchPaths() []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -373,6 +429,7 @@ type Snapshot struct {
 	LoginPath         string   `json:"login_path"`
 	CookieSecure      bool     `json:"cookie_secure"`
 	MonitoringEnabled bool     `json:"monitoring_enabled"`
+	SessionEpoch      int      `json:"session_epoch"`
 	AdminUsername     string   `json:"admin_username"`
 	AdminPassword     string   `json:"admin_password"`
 	AuditorUsername   string   `json:"auditor_username"`
@@ -403,6 +460,7 @@ func (c *Config) Snapshot() Snapshot {
 		LoginPath:         c.LoginPath,
 		CookieSecure:      c.CookieSecure,
 		MonitoringEnabled: c.MonitoringEnabled,
+		SessionEpoch:      c.SessionEpoch,
 		AdminUsername:     c.AdminUsername,
 		AdminPassword:     c.AdminPassword,
 		AuditorUsername:   c.AuditorUsername,

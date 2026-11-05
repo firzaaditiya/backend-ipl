@@ -15,6 +15,7 @@ import (
 
 	"github.com/skripsi/fim-ipl/internal/ledger"
 	"github.com/skripsi/fim-ipl/internal/models"
+	"github.com/skripsi/fim-ipl/internal/netguard"
 	"github.com/skripsi/fim-ipl/internal/realtime"
 	"github.com/skripsi/fim-ipl/internal/scanner"
 )
@@ -121,9 +122,17 @@ func validateWatchPaths(paths []string) ([]string, error) {
 
 // isPathWithinRoots memastikan target berada di bawah salah satu watch path.
 // Dipakai sebelum release karantina agar endpoint tidak bisa chmod file
-// sembarang di server.
+// sembarang di server. Symlink di-resolve dulu (EvalSymlinks) pada root
+// maupun target: tanpa ini, direktori symlink di dalam watch path dapat
+// mengarahkan chmod ke file di luar watch path.
 func isPathWithinRoots(roots []string, target string) bool {
 	targetAbs, err := filepath.Abs(target)
+	if err != nil {
+		return false
+	}
+	// Target yang tidak ada (mis. sudah dihapus) gagal fail-closed: release
+	// terhadap file yang tidak ada memang tidak punya arti.
+	targetResolved, err := filepath.EvalSymlinks(targetAbs)
 	if err != nil {
 		return false
 	}
@@ -133,12 +142,16 @@ func isPathWithinRoots(roots []string, target string) bool {
 		if err != nil {
 			continue
 		}
+		rootResolved, err := filepath.EvalSymlinks(rootAbs)
+		if err != nil {
+			continue
+		}
 		if runtime.GOOS == "windows" {
-			rootAbs = strings.ToLower(rootAbs)
-			targetAbs = strings.ToLower(targetAbs)
+			rootResolved = strings.ToLower(rootResolved)
+			targetResolved = strings.ToLower(targetResolved)
 		}
 
-		rel, err := filepath.Rel(rootAbs, targetAbs)
+		rel, err := filepath.Rel(rootResolved, targetResolved)
 		if err != nil {
 			continue
 		}
@@ -152,55 +165,14 @@ func isPathWithinRoots(roots []string, target string) bool {
 // validateWebhookURL memastikan URL backup webhook valid dan tidak mengarah
 // ke jaringan internal. Tanpa pemeriksaan ini, fitur webhook bisa disalahgunakan
 // sebagai SSRF (mis. http://169.254.169.254/latest/meta-data di cloud VPS).
+// Pemeriksaan dilakukan saat menyimpan DAN sesaat sebelum pengiriman
+// (internal/backup), karena DNS dapat berubah di antara kedua momen itu.
 func validateWebhookURL(raw string) error {
-	if raw == "" {
-		return nil
-	}
-	parsed, err := url.Parse(raw)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-		return errors.New("webhook URL must be a valid http:// or https:// URL")
-	}
-
-	host := parsed.Hostname()
-	if host == "" {
-		return errors.New("webhook URL must include a host")
-	}
-	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
-		return errors.New("webhook host must not be localhost")
-	}
-
-	if ip := net.ParseIP(host); ip != nil {
-		if isInternalIP(ip) {
-			return errors.New("webhook host must be a public address")
-		}
-		return nil
-	}
-
-	// Hostname: resolve seluruh A/AAAA record dan tolak jika ada yang internal.
-	// Validasi dilakukan saat menyimpan; DNS rebinding setelahnya tetap
-	// mungkin, sehingga pengiriman idealnya juga memakai dialer terbatas.
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return fmt.Errorf("cannot resolve webhook host %q", host)
-	}
-	if len(ips) == 0 {
-		return fmt.Errorf("webhook host %q has no address", host)
-	}
-	for _, ip := range ips {
-		if isInternalIP(ip) {
-			return errors.New("webhook host resolves to a non-public address")
-		}
-	}
-	return nil
+	return netguard.ValidatePublicURL(raw)
 }
 
 func isInternalIP(ip net.IP) bool {
-	return ip.IsLoopback() ||
-		ip.IsPrivate() ||
-		ip.IsUnspecified() ||
-		ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() ||
-		ip.IsMulticast()
+	return netguard.IsInternalIP(ip)
 }
 
 // validateOrigins memastikan setiap entry berupa origin (scheme + host[:port])

@@ -29,7 +29,8 @@ const maxBodyBytes = 1 << 20
 // Autentikasi sejak v1.1.0 hanya memakai cookie HttpOnly (SameSite=Lax).
 // Header Authorization TIDAK lagi diterima, dan CORS tidak lagi
 // mengizinkannya, agar tidak ada dua jalur autentikasi yang membingungkan.
-// Rate limit default 60 req/menit per-IP dengan burst penuh 60.
+// Rate limit default 60 req/menit per-IP dengan burst penuh 60; endpoint
+// login/setup memakai limiter terpisah 10 req/menit per-IP.
 func NewRouter(
 	cfg *config.Config,
 	l *ledger.Ledger,
@@ -54,20 +55,25 @@ func NewRouter(
 
 	// Token bucket: 60 request / 60 detik per-IP.
 	limiter := middleware.NewRateLimiter(60, 60)
+	// Limiter login terpisah yang lebih ketat: 10 percobaan / 60 detik
+	// per-IP, hanya untuk endpoint login dan setup awal. Login adalah
+	// satu-satunya endpoint publik yang memverifikasi password, jadi
+	// brute force tidak boleh menghabiskan bucket umum 60/menit.
+	loginLimiter := middleware.NewRateLimiter(10, 60)
 
 	core := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 
-		// -------- CORS (allowlist opsional) --------
+		// -------- CORS (allowlist) --------
+		// Fail-closed bila allowlist kosong: tidak ada header
+		// Access-Control-Allow-Origin yang dikirim sama sekali (bukan
+		// refleksi Origin apa pun, bukan `*`). Same-origin tidak butuh
+		// CORS; lintas origin hanya diizinkan bila terdaftar.
 		origins := cfg.GetAllowedOrigins()
 		origin := r.Header.Get("Origin")
-		if origin != "" {
-			if len(origins) == 0 || originAllowed(origins, origin) {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Add("Vary", "Origin")
-			}
-		} else if len(origins) == 0 {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
+		if origin != "" && len(origins) > 0 && originAllowed(origins, origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Add("Vary", "Origin")
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
@@ -93,6 +99,15 @@ func NewRouter(
 			return
 		}
 
+		// -------- Rate limit login (lebih ketat) --------
+		if (path == loginPath || path == "/api/v1/setup") && !loginLimiter.Allow(r) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "60")
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":"rate limit exceeded: too many login attempts"}`))
+			return
+		}
+
 		// -------- CSRF: pemeriksaan Origin untuk request mutasi --------
 		// Cookie sesi dikirim otomatis oleh browser, jadi endpoint mutasi
 		// wajib memastikan request datang dari origin yang sah. SameSite=Lax
@@ -100,8 +115,8 @@ func NewRouter(
 		// ini adalah lapis kedua untuk klien yang mengabaikan SameSite.
 		// Aturan: lolos bila Origin kosong (curl/alat admin), Origin
 		// sama dengan Host request (same-origin lewat proxy), atau Origin
-		// ada di allowlist. Bila allowlist kosong (mode lama), pemeriksaan
-		// dinonaktifkan — produksi wajib mengisi allowlist.
+		// ada di allowlist. Bila allowlist kosong, HANYA same-origin yang
+		// lolos (fail-closed); lintas origin tanpa allowlist ditolak.
 		if r.Method == http.MethodPost || r.Method == http.MethodPut ||
 			r.Method == http.MethodDelete || r.Method == http.MethodPatch {
 			if csrfOriginRejected(r, cfg.GetAllowedOrigins()) {
@@ -132,7 +147,9 @@ func NewRouter(
 		}
 
 		// -------- JWT cookie + RBAC --------
-		claims, ok := middleware.ParseClaims(r, jwtSecret)
+		// Epoch dibaca per-request (bukan sekali saat router dibuat) karena
+		// perubahan kredensial menaikkan epoch saat runtime.
+		claims, ok := middleware.ParseClaims(r, jwtSecret, cfg.GetSessionEpoch())
 		if !ok {
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
@@ -262,7 +279,7 @@ func NewRouter(
 // Origin-nya tidak sah. Lihat penjelasan di NewRouter.
 func csrfOriginRejected(r *http.Request, allowed []string) bool {
 	origin := r.Header.Get("Origin")
-	if origin == "" || len(allowed) == 0 {
+	if origin == "" {
 		return false
 	}
 	parsed, err := url.Parse(origin)
@@ -271,6 +288,10 @@ func csrfOriginRejected(r *http.Request, allowed []string) bool {
 	}
 	if parsed.Host == r.Host {
 		return false
+	}
+	if len(allowed) == 0 {
+		// Fail-closed: tanpa allowlist, hanya same-origin yang lolos.
+		return true
 	}
 	return !originAllowed(allowed, origin)
 }

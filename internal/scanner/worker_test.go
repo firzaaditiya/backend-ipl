@@ -25,7 +25,7 @@ func TestCompareWithBaselineDetectsAllActions(t *testing.T) {
 		sr("/w/created.php", "fresh"),
 	}
 
-	res := CompareWithBaseline(results, baseline)
+	res := CompareWithBaseline(results, baseline, 4)
 
 	if len(res.Modified) != 1 || res.Modified[0].FilePath != "/w/modified.php" {
 		t.Fatalf("expected 1 modified file, got %+v", res.Modified)
@@ -49,7 +49,7 @@ func TestCompareWithBaselineIgnoresMtimeOnlyChange(t *testing.T) {
 	result := sr("/w/a.php", "hash")
 	result.ModTime = time.Now()
 
-	res := CompareWithBaseline([]models.ScanResult{result}, baseline)
+	res := CompareWithBaseline([]models.ScanResult{result}, baseline, 4)
 	if res.TotalAnomalies() != 0 {
 		t.Fatalf("expected no anomalies for hash-equal file, got %d", res.TotalAnomalies())
 	}
@@ -64,7 +64,7 @@ func TestCompareWithBaselineIsDeterministic(t *testing.T) {
 		sr("/w/m.php", "1"),
 	}
 
-	res := CompareWithBaseline(results, baseline)
+	res := CompareWithBaseline(results, baseline, 4)
 	if len(res.Created) != 3 {
 		t.Fatalf("expected 3 created, got %d", len(res.Created))
 	}
@@ -85,7 +85,7 @@ func TestCompareUnreadableIsNotDeleted(t *testing.T) {
 		{Path: "/w/secret.php", Err: os.ErrPermission},
 	}
 
-	res := CompareWithBaseline(results, baseline)
+	res := CompareWithBaseline(results, baseline, 4)
 
 	if len(res.Deleted) != 0 {
 		t.Fatalf("file tidak terbaca tidak boleh dianggap DELETED: %+v", res.Deleted)
@@ -104,7 +104,7 @@ func TestCompareUnreadableNewFileIsReported(t *testing.T) {
 		{Path: "/w/backdoor.php", Err: os.ErrPermission},
 	}
 
-	res := CompareWithBaseline(results, map[string]models.FileRecord{})
+	res := CompareWithBaseline(results, map[string]models.FileRecord{}, 4)
 
 	if len(res.Created) != 0 || len(res.Deleted) != 0 {
 		t.Fatalf("unreadable baru tidak boleh menjadi CREATED/DELETED: %+v", res)
@@ -114,5 +114,49 @@ func TestCompareUnreadableNewFileIsReported(t *testing.T) {
 	}
 	if res.TotalAnomalies() != 1 {
 		t.Fatalf("expected 1 anomaly, got %d", res.TotalAnomalies())
+	}
+}
+
+func TestCompareOversizeFileIsNeitherDeletedNorUnreadable(t *testing.T) {
+	// File baseline yang tumbuh melewati 50 MB tidak boleh dilaporkan
+	// DELETED (file-nya masih ada) maupun UNREADABLE (bukan gagal baca).
+	baseline := map[string]models.FileRecord{
+		"/w/big.mp4": {Path: "/w/big.mp4", Hash: "oldhash"},
+	}
+	results := []models.ScanResult{
+		{Path: "/w/big.mp4", Err: ErrFileOversize},
+	}
+
+	res := CompareWithBaseline(results, baseline, 2)
+
+	if res.TotalAnomalies() != 0 {
+		t.Fatalf("expected 0 anomalies for oversize file, got %+v", res)
+	}
+}
+
+func TestCompareOversizeNewFileIsNotReported(t *testing.T) {
+	results := []models.ScanResult{
+		{Path: "/w/new-big.mp4", Err: ErrFileOversize},
+	}
+
+	res := CompareWithBaseline(results, map[string]models.FileRecord{}, 1)
+
+	if res.TotalAnomalies() != 0 {
+		t.Fatalf("expected 0 anomalies for new oversize file, got %+v", res)
+	}
+}
+
+func TestCompareWithBaselineRespectsWorkerCount(t *testing.T) {
+	baseline := map[string]models.FileRecord{}
+	results := []models.ScanResult{}
+	for i := 0; i < 10; i++ {
+		p := "/w/f" + string(rune('a'+i)) + ".php"
+		baseline[p] = models.FileRecord{Path: p, Hash: "h"}
+		results = append(results, models.ScanResult{Path: p, Hash: "h"})
+	}
+	// Satu worker pun harus menghasilkan hasil yang sama (deterministik).
+	res := CompareWithBaseline(results, baseline, 1)
+	if res.TotalAnomalies() != 0 {
+		t.Fatalf("expected 0 anomalies with 1 worker, got %+v", res)
 	}
 }

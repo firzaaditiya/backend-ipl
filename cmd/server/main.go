@@ -346,8 +346,8 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, tg *notifier.Teleg
 		results = filterActiveQuarantine(results, baseline, quarantinedPaths)
 	}
 
-	// 3) Compare
-	compareResult := scanner.CompareWithBaseline(results, baseline)
+	// 3) Compare (paralelisme pembanding mengikuti konfigurasi worker).
+	compareResult := scanner.CompareWithBaseline(results, baseline, sc.WorkerCount())
 	totalAnomalies := compareResult.TotalAnomalies()
 
 	if totalAnomalies == 0 {

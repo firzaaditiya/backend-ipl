@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/skripsi/fim-ipl/internal/api/middleware"
 	"github.com/skripsi/fim-ipl/internal/backup"
 	"github.com/skripsi/fim-ipl/internal/config"
 	"github.com/skripsi/fim-ipl/internal/ledger"
@@ -49,13 +50,28 @@ func (h *SettingsHandler) GetSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	snap := h.cfg.Snapshot()
+
+	// Auditor hanya butuh membaca konfigurasi operasional. Tujuan
+	// notifikasi (chat ID Telegram) dan URL webhook backup bukan kebutuhan
+	// Auditor, jadi disembunyikan dari respons role tersebut.
+	isAuditor := true
+	if claims, ok := middleware.ParseClaims(r, snap.JWTSecret, snap.SessionEpoch); ok {
+		isAuditor = claims.Role == middleware.RoleAuditor
+	}
+	telegramChatID := snap.TelegramChatID
+	backupWebhookURL := snap.BackupWebhookURL
+	if isAuditor {
+		telegramChatID = ""
+		backupWebhookURL = ""
+	}
+
 	settings := map[string]interface{}{
 		"watch_paths":         snap.WatchPaths,
 		"scan_interval_sec":   snap.ScanIntervalSec,
 		"worker_count":        snap.WorkerCount,
-		"telegram_chat_id":    snap.TelegramChatID,
+		"telegram_chat_id":    telegramChatID,
 		"telegram_configured": h.notifier.IsConfigured(),
-		"backup_webhook_url":  snap.BackupWebhookURL,
+		"backup_webhook_url":  backupWebhookURL,
 		"allowed_origins":     snap.AllowedOrigins,
 		"is_monitoring":       h.scanner.IsRunning(),
 		"maintenance_mode":    h.scanner.IsMaintenance(),
@@ -79,7 +95,7 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 		WorkerCount      int      `json:"worker_count"`
 		TelegramToken    string   `json:"telegram_token"`
 		TelegramChatID   string   `json:"telegram_chat_id"`
-		BackupWebhookURL string   `json:"backup_webhook_url"`
+		BackupWebhookURL *string  `json:"backup_webhook_url"`
 		AllowedOrigins   []string `json:"allowed_origins"`
 	}
 
@@ -96,9 +112,11 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "worker_count must be between 1 and 16"})
 		return
 	}
-	if err := validateWebhookURL(req.BackupWebhookURL); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
+	if req.BackupWebhookURL != nil {
+		if err := validateWebhookURL(*req.BackupWebhookURL); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
 	}
 
 	watchPaths := req.WatchPaths
@@ -136,8 +154,12 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 		if req.TelegramChatID != "" {
 			c.TelegramChatID = req.TelegramChatID
 		}
-		// BackupWebhookURL: string kosong artinya "hapus webhook".
-		c.BackupWebhookURL = req.BackupWebhookURL
+		// BackupWebhookURL: pointer nil = field tidak dikirim (biarkan nilai
+		// lama); string kosong eksplisit = hapus webhook. Sebelum v1.4.0,
+		// update parsial tanpa field ini menghapus webhook secara diam-diam.
+		if req.BackupWebhookURL != nil {
+			c.BackupWebhookURL = *req.BackupWebhookURL
+		}
 		// AllowedOrigins: array kosong eksplisit berarti "izinkan semua".
 		if req.AllowedOrigins != nil {
 			c.AllowedOrigins = origins

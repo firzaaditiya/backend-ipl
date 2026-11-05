@@ -213,7 +213,7 @@ func (h *QuarantineHandler) ListQuarantined(w http.ResponseWriter, r *http.Reque
 			m := fmt.Sprintf("%04o", *f.OriginalMode)
 			it.OriginalMode = &m
 		}
-		if info, err := os.Stat(f.FilePath); err == nil {
+		if info, err := os.Lstat(f.FilePath); err == nil {
 			it.Exists = true
 			m := fmt.Sprintf("%04o", info.Mode().Perm())
 			it.CurrentMode = &m

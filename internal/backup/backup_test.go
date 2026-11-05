@@ -63,6 +63,48 @@ func TestRunOnceRequiresChannel(t *testing.T) {
 	}
 }
 
+func TestPostWebhookRejectsInternalAddress(t *testing.T) {
+	m := NewManager(newTestLedger(t), nil, "", time.Hour)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("internal webhook target must not be contacted")
+	}))
+	defer srv.Close()
+
+	if err := m.postWebhook(srv.URL+"/hook", "test.json", []byte("{}")); err == nil {
+		t.Fatal("expected webhook to 127.0.0.1 to be refused")
+	}
+}
+
+func TestPostWebhookRejectsRedirect(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("redirect target must not be contacted")
+	}))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", target.URL+"/hook")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	m := NewManager(newTestLedger(t), nil, "", time.Hour)
+	// Izinkan localhost hanya agar redirect-nya teramati, dan pakai client
+	// tanpa dial guard agar yang diuji murni perilaku redirect (produksi
+	// memakai keduanya: dial guard + penolakan redirect).
+	m.allowLocalWebhook = true
+	m.httpClient = &http.Client{
+		Timeout: 20 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	if err := m.postWebhook(redirector.URL+"/hook", "test.json", []byte("{}")); err == nil || !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf("expected redirect rejection, got %v", err)
+	}
+}
+
 func TestStopWaitsForInFlightRun(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -74,6 +116,8 @@ func TestStopWaitsForInFlightRun(t *testing.T) {
 	defer srv.Close()
 
 	m := NewManager(newTestLedger(t), nil, srv.URL, time.Hour)
+	// httptest berjalan di 127.0.0.1; izinkan hanya untuk test ini.
+	m.allowLocalWebhook = true
 
 	runErr := make(chan error, 1)
 	go func() {

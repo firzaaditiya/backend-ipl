@@ -1,7 +1,9 @@
 {
-  "server_port": ":8080",
+  "server_port": "127.0.0.1:8080",
   "jwt_secret": "",
   "login_path": "/api/v1/secure-gate",
+  "cookie_secure": true,
+  "session_epoch": 0,
   "admin_username": "admin",
   "admin_password": "",
   "auditor_username": "",
