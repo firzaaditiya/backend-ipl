@@ -39,7 +39,7 @@ func NewRouter(
 	bm *backup.Manager,
 	hub *realtime.Hub,
 ) http.Handler {
-	authHandler := handlers.NewAuthHandler(cfg)
+	authHandler := handlers.NewAuthHandler(cfg, l)
 	dashboardHandler := handlers.NewDashboardHandler(l, s)
 	ledgerHandler := handlers.NewLedgerHandler(l)
 	settingsHandler := handlers.NewSettingsHandler(cfg, l, s, n, bm, hub)
@@ -79,11 +79,6 @@ func NewRouter(
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
 		if r.Body != nil {
 			r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 		}
@@ -91,6 +86,10 @@ func NewRouter(
 		// -------- Rate limit (per-IP) --------
 		// Stream SSE berumur panjang dan sering reconnect, jadi tidak dihitung
 		// sebagai request biasa agar tidak mengunci klien yang sah.
+		// Preflight OPTIONS JUGA dihitung (sejak v1.5.0): early-return
+		// sebelum limiter memberi jalur gratis membanjiri server dengan
+		// OPTIONS. Preflight browser yang sah tetap lolos — ia di-cache
+		// 86400 detik lewat Access-Control-Max-Age di atas.
 		if path != "/api/v1/events" && !limiter.Allow(r) {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Retry-After", "60")
@@ -105,6 +104,11 @@ func NewRouter(
 			w.Header().Set("Retry-After", "60")
 			w.WriteHeader(http.StatusTooManyRequests)
 			w.Write([]byte(`{"error":"rate limit exceeded: too many login attempts"}`))
+			return
+		}
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
@@ -148,8 +152,14 @@ func NewRouter(
 
 		// -------- JWT cookie + RBAC --------
 		// Epoch dibaca per-request (bukan sekali saat router dibuat) karena
-		// perubahan kredensial menaikkan epoch saat runtime.
-		claims, ok := middleware.ParseClaims(r, jwtSecret, cfg.GetSessionEpoch())
+		// perubahan kredensial menaikkan epoch saat runtime. Token yang
+		// sudah logout (jti di denylist ledger) juga ditolak di sini.
+		claims, ok := middleware.ParseClaimsWithRevocation(r, jwtSecret, cfg.GetSessionEpoch(), func(jti string) bool {
+			if l == nil {
+				return false
+			}
+			return l.IsTokenRevoked(jti)
+		})
 		if !ok {
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return

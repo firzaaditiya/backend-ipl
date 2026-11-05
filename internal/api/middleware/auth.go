@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"time"
@@ -73,6 +75,14 @@ type Claims struct {
 }
 
 func ParseClaims(r *http.Request, secret string, epoch int) (*Claims, bool) {
+	return ParseClaimsWithRevocation(r, secret, epoch, nil)
+}
+
+// ParseClaimsWithRevocation sama seperti ParseClaims, ditambah pemeriksaan
+// denylist logout: bila isRevoked != nil dan jti token ada di denylist,
+// token ditolak. Token lama tanpa jti (sebelum v1.5.0) tidak bisa dicabut
+// satu-per-satu dan tetap diterima sampai kedaluwarsa atau epoch naik.
+func ParseClaimsWithRevocation(r *http.Request, secret string, epoch int, isRevoked func(string) bool) (*Claims, bool) {
 	cookie, err := r.Cookie(SessionCookieName)
 	if err != nil || cookie.Value == "" {
 		return nil, false
@@ -108,24 +118,12 @@ func ParseClaims(r *http.Request, secret string, epoch int) (*Claims, bool) {
 	if epoch >= 0 && claims.SessionEpoch != epoch {
 		return nil, false
 	}
-	return claims, true
-}
-
-func ValidateRequest(r *http.Request, secret string, epoch int) bool {
-	_, ok := ParseClaims(r, secret, epoch)
-	return ok
-}
-
-func JWTAuth(secret string, epoch int) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !ValidateRequest(r, secret, epoch) {
-				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
+	// Token yang sudah logout (jti di denylist) ditolak walau belum
+	// kedaluwarsa.
+	if isRevoked != nil && claims.ID != "" && isRevoked(claims.ID) {
+		return nil, false
 	}
+	return claims, true
 }
 
 func GenerateToken(username, role, secret string, expireHours int, epoch int) (string, time.Time, error) {
@@ -136,11 +134,20 @@ func GenerateToken(username, role, secret string, expireHours int, epoch int) (s
 		return "", time.Time{}, errors.New("invalid role")
 	}
 
+	// jti acak: pengenal sesi yang dicabut saat logout (denylist). Tanpa
+	// ini, logout hanya menghapus cookie dan token tetap bisa dipakai
+	// sampai kedaluwarsa.
+	jtiBytes := make([]byte, 16)
+	if _, err := rand.Read(jtiBytes); err != nil {
+		return "", time.Time{}, errors.New("failed to generate token id")
+	}
+
 	claims := &Claims{
 		Username:     username,
 		Role:         role,
 		SessionEpoch: epoch,
 		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        hex.EncodeToString(jtiBytes),
 			ExpiresAt: jwt.NewNumericDate(expiresAt),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			Issuer:    tokenIssuer,

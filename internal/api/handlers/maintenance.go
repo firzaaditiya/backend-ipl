@@ -73,6 +73,30 @@ func (h *MaintenanceHandler) UpdateBaseline(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Rebuild membuang entri baseline untuk file yang tidak terbaca saat
+	// re-scan — termasuk file yang sedang dikarantina (chmod 000). Bila
+	// file itu dilepas setelah rebuild, ia tidak ada lagi di baseline dan
+	// siklus berikutnya melaporkannya CREATED lalu mengkarantinanya lagi:
+	// admin mengira pelepasannya gagal. Tolak rebuild selama masih ada
+	// file terkarantina; admin harus melepasnya dulu (atau menghapusnya
+	// dari disk) sebelum rebuild.
+	qfiles, err := h.ledger.QuarantinedFiles()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to check quarantine state"})
+		return
+	}
+	if len(qfiles) > 0 {
+		paths := make([]string, 0, len(qfiles))
+		for _, f := range qfiles {
+			paths = append(paths, f.FilePath)
+		}
+		writeJSON(w, http.StatusConflict, map[string]interface{}{
+			"error":             "baseline rebuild refused: files are still quarantined; release or delete them first",
+			"quarantined_files": paths,
+		})
+		return
+	}
+
 	log.Println("[Maintenance] Rebuilding baseline...")
 
 	total, err := scanAndSaveBaseline(h.scanner, h.ledger)
@@ -149,7 +173,10 @@ func (h *QuarantineHandler) Release(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := quarantine.Release(cleanPath, restoreMode); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		// Detail error OS dicatat di server saja; klien hanya mendapat
+		// pesan generik agar jalur filesystem tidak bocor ke respons.
+		log.Printf("[Quarantine] Release failed for %s: %v", cleanPath, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to release file"})
 		return
 	}
 	// Catatan mode sudah tidak diperlukan lagi; kegagalan menghapusnya

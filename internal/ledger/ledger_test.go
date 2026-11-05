@@ -277,12 +277,12 @@ func TestAnomalyCountExcludesReleaseRecords(t *testing.T) {
 		t.Fatalf("expected 3 ledger blocks, got %d", blocks)
 	}
 
-	anomalies, err := l.GetAnomalyCount()
+	counts, err := l.GetDashboardCounts()
 	if err != nil {
-		t.Fatalf("GetAnomalyCount: %v", err)
+		t.Fatalf("GetDashboardCounts: %v", err)
 	}
-	if anomalies != 2 {
-		t.Fatalf("expected release block excluded from anomaly count, got %d", anomalies)
+	if counts.Anomalies != 2 {
+		t.Fatalf("expected release block excluded from anomaly count, got %d", counts.Anomalies)
 	}
 
 	// Release menutup status karantina path tersebut.
@@ -387,5 +387,82 @@ func TestSearchBlocksNewestFirstAndPaginated(t *testing.T) {
 	}
 	if total != 0 || page == nil || len(page) != 0 {
 		t.Fatalf("expected non-nil empty slice, got total=%d page=%#v", total, page)
+	}
+}
+
+func TestAdoptBaselineModesOnlyFillsZero(t *testing.T) {
+	l := newTestLedger(t)
+
+	legacy := record("/var/www/legacy.php", "h1")
+	legacy.Mode = 0
+	withMode := record("/var/www/with-mode.php", "h2")
+	withMode.Mode = 0o600
+	if err := l.SaveBaseline([]models.FileRecord{legacy, withMode}); err != nil {
+		t.Fatalf("SaveBaseline: %v", err)
+	}
+
+	if err := l.AdoptBaselineModes(map[string]uint32{
+		"/var/www/legacy.php":    0o644,
+		"/var/www/with-mode.php": 0o777, // tidak boleh menimpa mode yang sudah ada
+		"/var/www/missing.php":   0o644, // tidak ada di baseline: diabaikan
+	}); err != nil {
+		t.Fatalf("AdoptBaselineModes: %v", err)
+	}
+
+	baseline, err := l.GetBaseline()
+	if err != nil {
+		t.Fatalf("GetBaseline: %v", err)
+	}
+	if baseline["/var/www/legacy.php"].Mode != 0o644 {
+		t.Fatalf("legacy mode should be adopted as 0644, got %04o", baseline["/var/www/legacy.php"].Mode)
+	}
+	if baseline["/var/www/with-mode.php"].Mode != 0o600 {
+		t.Fatalf("existing mode must not be overwritten, got %04o", baseline["/var/www/with-mode.php"].Mode)
+	}
+}
+
+func TestRevokeTokenRoundTrip(t *testing.T) {
+	l := newTestLedger(t)
+
+	if l.IsTokenRevoked("jti-1") {
+		t.Fatal("unknown jti must not be revoked")
+	}
+	if err := l.RevokeToken("jti-1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("RevokeToken: %v", err)
+	}
+	if !l.IsTokenRevoked("jti-1") {
+		t.Fatal("revoked jti must be reported revoked")
+	}
+	if l.IsTokenRevoked("jti-2") {
+		t.Fatal("other jti must not be revoked")
+	}
+}
+
+func TestRevokeTokenExpiredIsNotRevoked(t *testing.T) {
+	l := newTestLedger(t)
+
+	if err := l.RevokeToken("jti-old", time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("RevokeToken: %v", err)
+	}
+	if l.IsTokenRevoked("jti-old") {
+		t.Fatal("expired revocation must not block the token (it is dead by itself)")
+	}
+}
+
+func TestAppendBlockRecordsModes(t *testing.T) {
+	l := newTestLedger(t)
+
+	ev := event("/var/www/wp-config.php", models.ActionModeChanged, "h", "h", true)
+	ev.OldMode = 0o644
+	ev.NewMode = 0o777
+	block, err := l.AppendBlock(ev)
+	if err != nil {
+		t.Fatalf("AppendBlock: %v", err)
+	}
+	if block.OldMode != 0o644 || block.NewMode != 0o777 {
+		t.Fatalf("block must record modes, got old=%04o new=%04o", block.OldMode, block.NewMode)
+	}
+	if res := l.VerifyChain(); !res.Valid {
+		t.Fatalf("chain must stay valid with mode fields: %s", res.Message)
 	}
 }

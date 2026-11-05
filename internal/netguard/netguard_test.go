@@ -13,6 +13,7 @@ func TestIsInternalIP(t *testing.T) {
 		"100.64.0.1", "100.127.255.255", // CGNAT (RFC 6598)
 		"192.0.0.170", "192.0.2.1", // 192.0.0.0/24 + TEST-NET-1 (ditolak eksplisit; IsPrivate Go tidak mencakupnya)
 		"198.18.0.1", "198.19.255.255", // benchmarking (RFC 2544)
+		"240.0.0.1", "255.255.255.255", // reserved 240.0.0.0/4 (RFC 1112; tidak dicakup IsPrivate Go)
 	}
 	for _, s := range internal {
 		if !IsInternalIP(net.ParseIP(s)) {

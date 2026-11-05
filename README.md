@@ -1,12 +1,13 @@
 # FIM-IPL Backend
 
-**Versi: 1.4.0** (sumber versi tunggal: `AppVersion` di
+**Versi: 1.5.0** (sumber versi tunggal: `AppVersion` di
 `internal/api/handlers/system.go`; tampil di UI dan `/api/v1/healthz`).
 
 FIM-IPL Backend adalah daemon File Integrity Monitoring (FIM) dan REST API
 untuk memantau perubahan file pada server web. Sistem membandingkan hash
 SHA-256 dengan baseline, mencatat kejadian ke Immutable Private Ledger lokal,
-menonaktifkan file mencurigakan, dan mengirim notifikasi operasional.
+menonaktifkan file baru atau berubah (termasuk file sah, sampai diperiksa
+operator), dan mengirim notifikasi operasional.
 
 Repository ini berisi daemon + API, konfigurasi contoh, deployment unit
 systemd, contoh secret, dan script simulasi serangan (`scripts/attack_sim.*`).
@@ -25,9 +26,9 @@ filepath.Walk + worker pool + SHA-256
       v
 bandingkan dengan baseline
       |
-      +--> CREATED / MODIFIED --> quarantine --> ledger --> Telegram
+      +--> CREATED / MODIFIED / MODE_CHANGED --> karantina --> ledger --> Telegram
       +--> DELETED ------------> ledger -----------------> Telegram
-      +--> UNREADABLE ---------> alert + ledger ----------> Telegram
+      +--> UNREADABLE ---------> karantina (fail-closed) --> ledger --> Telegram
       |
       v
 metrics + SSE + dashboard API
@@ -42,7 +43,8 @@ dan Windows, serta tidak kehilangan perubahan ketika daemon restart.
 - Hash SHA-256 untuk baseline dan perubahan file.
 - Worker pool untuk pemindaian paralel (hashing dan perbandingan baseline
   memakai `worker_count` yang sama, 1–16).
-- Aksi `CREATED`, `MODIFIED`, `DELETED`, dan `UNREADABLE`.
+- Aksi `CREATED`, `MODIFIED`, `MODE_CHANGED` (perubahan izin saja, sejak
+  v1.5.0), `DELETED`, dan `UNREADABLE`.
 - Karantina Linux dengan `chmod 000`.
 - Karantina Windows dengan best-effort ReadOnly attribute.
 - Immutable Private Ledger lokal berbasis Bbolt dan hash-chain. "Immutable"
@@ -62,7 +64,9 @@ dan Windows, serta tidak kehilangan perubahan ketika daemon restart.
 - Environment override untuk secret deployment (JWT, password admin/auditor,
   token Telegram) dan sebagian parameter operasi — lihat tabel di
   §Konfigurasi dan Secret untuk daftar persisnya. `watch_paths` dan
-  `login_path` hanya lewat `config.json`/Settings API.
+  `login_path` hanya lewat `config.json`/Settings API; `allowed_origins`
+  TIDAK bisa diubah dari dashboard — hanya lewat `config.json` atau
+  `FIM_ALLOWED_ORIGINS`.
 - Mode strict (`FIM_STRICT_SECRETS=1`) yang menolak JWT secret lemah saat
   startup. Yang menolak penyimpanan kredensial di `config.json` adalah flag
   terpisah, `FIM_REQUIRE_EXTERNAL_SECRETS=1` — keduanya tidak sama.
@@ -78,11 +82,13 @@ dan Windows, serta tidak kehilangan perubahan ketika daemon restart.
 
 Dependensi kunci (terkunci di `go.sum`): `golang-jwt/jwt/v5 v5.3.1`,
 `go.etcd.io/bbolt v1.4.3`, `golang.org/x/crypto v0.58.0`,
-`golang.org/x/sys v0.49.0` (indirect). v1.4.0 menaikkan `x/crypto` dari
-v0.51.0 ke v0.58.0 dan `x/sys` v0.44.0 ke v0.49.0 setelah `govulncheck`
-menemukan 17 vuln yang tidak terpanggil di `x/crypto` v0.51.0; setelah
-kenaikan tersisa 1 vuln yang tidak terpanggil (perbaikannya hanya ada di
-versi pseudo-release, bukan rilis stabil, jadi tidak dikejar).
+`golang.org/x/sys v0.49.0` (require langsung sejak v1.5.0, dipakai paket
+`internal/fsx`). v1.4.0 menaikkan `x/crypto` dari v0.51.0 ke v0.58.0 dan
+`x/sys` v0.44.0 ke v0.49.0 setelah `govulncheck` menemukan 17 vuln yang
+tidak terpanggil di `x/crypto` v0.51.0; setelah kenaikan tersisa 1 vuln
+yang tidak terpanggil (perbaikannya hanya ada di versi pseudo-release,
+bukan rilis stabil, jadi tidak dikejar). Hasil `govulncheck` v1.5.0 sama
+(2026-11-05, lihat §Testing dan Quality Gate).
 
 ## Menjalankan Lokal
 
@@ -131,8 +137,13 @@ mengembalikan 403 `password already configured`):
 ```bash
 curl -X POST http://127.0.0.1:8080/api/v1/setup \
   -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"GANTI-DENGAN-PASSWORD-KUAT-MINIMAL-8-KARAKTER"}'
+  -d '{"username":"admin","password":"GANTI-DENGAN-PASSWORD-KUAT-8-SAMPAI-72-KARAKTER"}'
 ```
+
+Username wajib diisi dan password harus 8–72 karakter (di luar itu 400);
+hal yang sama berlaku untuk `POST /api/v1/setup/auditor`. Bila penyimpanan
+konfigurasi gagal setelah validasi, perubahan di memori dibatalkan agar
+memori dan disk tidak berbeda (sejak v1.5.0).
 
 Setelah itu: login di `POST /api/v1/secure-gate`, lalu `POST
 /api/v1/baseline/init` dan `POST /api/v1/monitoring/start` (keduanya Super
@@ -157,14 +168,15 @@ sebaiknya hanya diberikan lewat environment atau systemd credentials.
 | `FIM_TELEGRAM_TOKEN` | Token bot Telegram |
 | `FIM_TELEGRAM_CHAT_ID` | Tujuan chat Telegram |
 | `FIM_BACKUP_WEBHOOK_URL` | URL webhook backup ledger (harus alamat publik) |
+| `FIM_WEBHOOK_SECRET` | Secret HMAC-SHA256 untuk menandatangani POST webhook backup (sejak v1.5.0; bila tidak di-set, webhook dikirim tanpa tanda tangan) |
 | `FIM_SCAN_INTERVAL_SEC` | Interval scan, 30–86400 (nilai di luar rentang diabaikan) |
 | `FIM_WORKER_COUNT` | Worker hashing/perbandingan, 1–16 |
 | `FIM_ALLOWED_ORIGINS` | Daftar origin CORS dipisahkan koma |
 | `FIM_COOKIE_SECURE` | `1` (default) = cookie sesi memakai atribut Secure; `0` hanya untuk dev HTTP lokal |
 | `FIM_TRUST_PROXY` | `1` = rate limit, pembatas SSE, dan log login memakai IP klien dari header proxy. Hanya aktifkan bila backend hanya terjangkau lewat reverse proxy tepercaya yang MENIMPA `X-Forwarded-For` dengan IP penghubung (`proxy_set_header X-Forwarded-For $remote_addr`). Backend memakai `CF-Connecting-IP` dulu (ditulis ulang edge Cloudflare menjadi IP klien asli, tidak dapat dipalsukan lewat Tunnel), lalu `X-Forwarded-For`, lalu `X-Real-IP`. Tanpa flag ini, semua request lewat proxy terlihat dari `127.0.0.1` dan berbagi satu bucket rate limit. |
-| `FIM_STRICT_SECRETS=1` | Tolak JWT secret lemah |
-| `FIM_REQUIRE_EXTERNAL_SECRETS=1` | Tolak credential di `config.json` |
-| `FIM_REQUIRE_LOCAL_API=1` | Tolak binding API wildcard |
+| `FIM_STRICT_SECRETS` | `1` = tolak JWT secret lemah |
+| `FIM_REQUIRE_EXTERNAL_SECRETS` | `1` = tolak credential di `config.json` |
+| `FIM_REQUIRE_LOCAL_API` | `1` = tolak binding API wildcard |
 
 `FIM_REQUIRE_EXTERNAL_SECRETS=1` dan `FIM_REQUIRE_LOCAL_API=1` sebaiknya selalu
 dipakai di server produksi, DENGAN satu pengecualian: `FIM_REQUIRE_EXTERNAL_SECRETS=1`
@@ -175,7 +187,7 @@ sebagai sumber kebenaran runtime untuk Telegram dan Auditor, sementara JWT
 secret dan password admin tetap dari `fim.env` (environment menang atas
 `config.json` saat restart).
 
-## Sesi dan autentikasi (v1.1.0, diperketat v1.4.0)
+## Sesi dan autentikasi (v1.1.0, diperketat v1.4.0, pencabutan per-sesi v1.5.0)
 
 Satu-satunya mekanisme autentikasi adalah cookie sesi HttpOnly:
 
@@ -188,15 +200,18 @@ Satu-satunya mekanisme autentikasi adalah cookie sesi HttpOnly:
   dua jalur autentikasi). Frontend membuktikan sesi lewat `GET /api/v1/auth/me`
   pada setiap refresh halaman, dan keluar lewat `POST /api/v1/auth/logout`
   yang menghapus cookie.
-- Logout HANYA menghapus cookie di browser — token tetap valid di sisi
-  server sampai kedaluwarsa 24 jam. Yang membatalkan token adalah pergantian
-  kredensial: `POST /api/v1/setup` dan `POST /api/v1/setup/auditor`
-  menaikkan `session_epoch` di `config.json`, dan token dari epoch lama
-  ditolak. Batasan ini dinyatakan apa adanya; tidak ada daftar pencabutan
-  token per-sesi.
-- Percobaan login yang gagal dicatat di log server (username + IP klien,
-  tanpa password). Username dibandingkan dalam waktu konstan dan username
-  tak dikenal tetap menjalani bcrypt dummy agar timing seragam.
+- Sejak v1.5.0 setiap token membawa ID sesi acak (`jti`) dan logout
+  MENCABUT sesi itu di sisi server: `jti` ditulis ke bucket `revoked_tokens`
+  di Bbolt dan token yang sama ditolak pada request berikutnya. Token yang
+  diterbitkan sebelum v1.5.0 (tanpa `jti`) tidak dapat dicabut satu per satu;
+  yang tetap membatalkan SEMUA token adalah pergantian kredensial:
+  `POST /api/v1/setup` dan `POST /api/v1/setup/auditor` menaikkan
+  `session_epoch` di `config.json`, dan token dari epoch lama ditolak.
+- Percobaan login yang gagal dan yang berhasil dicatat di log server
+  (username + IP klien, tanpa password; username dipotong 64 karakter agar
+  satu baris log tidak membengkak). Username dibandingkan dalam waktu
+  konstan dan username tak dikenal tetap menjalani bcrypt dummy agar timing
+  seragam.
 - CSRF: selain `SameSite=Lax`, request mutasi (`POST`/`PUT`/`DELETE`/`PATCH`)
   diperiksa Origin-nya — lolos bila Origin kosong (curl/alat admin), sama
   dengan Host request (same-origin lewat proxy), atau ada di allowlist.
@@ -206,10 +221,12 @@ Satu-satunya mekanisme autentikasi adalah cookie sesi HttpOnly:
   `Access-Control-Allow-Origin` sama sekali. Produksi wajib mengisi
   `allowed_origins` dengan origin dashboard.
 - Rate limit: 60 request/menit per-IP (burst 60) untuk semua endpoint
-  kecuali SSE `/events`; endpoint login dan setup awal memakai limiter
-  terpisah yang lebih ketat, 10 request/menit per-IP (keduanya
-  mengembalikan 429 dengan `Retry-After: 60`). Rate limit memakai IP dari
-  `X-Forwarded-For` hanya bila `FIM_TRUST_PROXY=1` — lihat tabel env.
+  kecuali SSE `/events`, termasuk preflight OPTIONS sejak v1.5.0 (sebelumnya
+  OPTIONS lolos sebelum limiter); endpoint login dan setup awal memakai
+  limiter terpisah yang lebih ketat, 10 request/menit per-IP (keduanya
+  mengembalikan 429 dengan `Retry-After: 60`). Rate limit memakai IP klien
+  dengan urutan `CF-Connecting-IP`, lalu `X-Forwarded-For`, lalu
+  `X-Real-IP` — dan hanya bila `FIM_TRUST_PROXY=1` (lihat tabel env).
 - Frontend dan API WAJIB satu origin di deployment produksi (proxy Nginx
   yang sama). Kode tetap mengizinkan origin lintas situs yang terdaftar di
   `allowed_origins`; satu origin adalah pilihan deployment, bukan paksaan
@@ -260,6 +277,100 @@ antarmuka tidak lagi menampilkan angka izin yang ditebak (sebelumnya
 pesan sukses di Audit Trail selalu menulis 0644, padahal izin yang
 dipulihkan bisa 0600 atau 0640).
 
+## Deteksi perubahan izin (MODE_CHANGED) (v1.5.0)
+
+Sebelum v1.5.0, scanner hanya membandingkan hash SHA-256: perubahan izin
+saja (mis. `chmod 777 wp-config.php`) tidak menghasilkan kejadian apa pun —
+hanya `chmod 000` yang tertangkap secara tidak langsung sebagai UNREADABLE.
+Sejak v1.5.0, setiap entri baseline juga menyimpan mode izin, dan setiap
+siklus membandingkan hash DAN mode:
+
+- Hash berbeda → `MODIFIED` (dengan mode lama dan baru).
+- Hash sama, mode berbeda → `MODE_CHANGED`, dengan `old_hash == new_hash`
+  dan metadata `old_mode`/`new_mode` pada blok. Seperti `quarantine_err`,
+  kedua mode itu metadata dan TIDAK masuk material hash blok, jadi formula
+  hash tidak berubah dan ledger lama tetap terverifikasi.
+- `MODE_CHANGED` dikarantina seperti `MODIFIED`: berkas dinonaktifkan
+  sampai operator memeriksa dan melepasnya. Perlu dipahami arti pelepasan
+  di sini: pelepasan mengembalikan izin seperti SAAT DIKARANTINA — untuk
+  berkas `MODE_CHANGED` berarti izin BARU (mis. 0777), bukan izin baseline
+  lama (0644). Pelepasan adalah persetujuan operator atas keadaan berkas
+  saat itu; perubahan izinnya sendiri tetap tercatat permanen di blok
+  `MODE_CHANGED` (mode lama → mode baru). Bila operator ingin berkas
+  kembali ke izin baseline, ubah izinnya secara manual lalu jalankan
+  `baseline/update` (atau lewat maintenance mode, lihat SOP di naskah).
+
+Baseline yang dibuat sebelum v1.5.0 tidak punya mode tersimpan. Pada siklus
+pertama setelah upgrade, mode setiap berkas diadopsi diam-diam ke baseline
+(TANPA kejadian anomali) — bila tidak begitu, seluruh 3901 berkas akan
+dilaporkan `MODE_CHANGED` sekaligus. Adopsi ini dicatat di log server
+("Adopted modes for N baseline file(s)").
+
+## Backup & notifikasi
+
+- Backup ledger (export JSON) berjalan otomatis setiap 24 jam dan saat
+  anomali kritis: ≥5 blok baru dalam satu siklus (label `critical-anomaly`).
+  Backup manual lewat `POST /api/v1/backup/run` gagal hanya bila Telegram
+  DAN webhook sama-sama gagal; satu kanal yang berhasil sudah cukup.
+- Peringatan Telegram: ≤3 anomali dikirim per blok; >3 anomali dalam satu
+  siklus diringkas menjadi satu pesan; ≥50 anomali menjadi satu pesan
+  perubahan massal (maks. 5 berkas disebut). Sejak v1.5.0 pengiriman
+  berjalan asinkron lewat antrean pekerja, sehingga Telegram yang lambat
+  tidak pernah menunda siklus scan berikutnya (sebelumnya pengiriman
+  sinkron dapat membuat satu siklus melebihi interval 120 detik dan siklus
+  berikutnya dilewati sebagai "overlap").
+- Anomali yang belum selesai TIDAK ditulis ulang ke ledger setiap siklus;
+  ledger hanya mencatat kejadian baru. Setelah karantina berhasil, hash
+  baru berkas masuk ke baseline, sehingga berkas yang sama berhenti
+  dilaporkan pada siklus berikutnya.
+- Webhook backup mengirim header `X-FIM-IPL-File` (nama file export) dan,
+  bila `FIM_WEBHOOK_SECRET` di-set, `X-FIM-IPL-Signature`
+  (`sha256=<HMAC-SHA256(secret, timestamp + "." + body)>`) beserta
+  `X-FIM-IPL-Timestamp`. Penerima sebaiknya menolak timestamp yang lebih
+  tua dari 5 menit (anti-replay). Tanpa secret, webhook dikirim tanpa tanda
+  tangan (lihat §Batasan).
+- Koneksi webhook memakai dialer yang hanya menghubungi alamat IP publik
+  yang sudah divalidasi: hostname di-resolve SEKALI, lalu dial memakai
+  literal IP hasil resolve itu — tidak ada lagi resolve kedua yang membuka
+  jendela DNS rebinding (sebelumnya ada di v1.4.0). TLS tetap memverifikasi
+  sertifikat terhadap hostname URL.
+
+## Pengerasan v1.5.0
+
+- Deteksi perubahan mode (`MODE_CHANGED`) seperti dijelaskan di atas,
+  termasuk adopsi mode baseline lama tanpa kejadian palsu.
+- Rebuild baseline (`POST /api/v1/baseline/update`) kini menolak dengan 409
+  beserta daftar `quarantined_files` bila masih ada berkas dikarantina.
+  Sebelumnya rebuild diam-diam menghapus berkas yang dikarantina dari
+  baseline, lalu pelepasannya dilaporkan sebagai CREATED dan dikarantina
+  ulang — operator mengira pelepasan gagal.
+- Logout mencabut sesi itu di sisi server (denylist `jti`, bucket
+  `revoked_tokens` — bucket keenam Bbolt, di luar hash-chain).
+- `POST /api/v1/setup` dan `POST /api/v1/setup/auditor` menolak username
+  kosong dan password di luar 8–72 karakter (sebelumnya setup dengan
+  username kosong dapat mengunci akun selamanya: password tersimpan, setup
+  menolak 403, tetapi tidak ada username yang bisa login).
+- `telegram_chat_id` kini mengikuti aturan pointer yang sama dengan
+  `backup_webhook_url` (nil = biarkan, string kosong = hapus); sebelumnya
+  chat ID tidak pernah bisa dikosongkan dari UI.
+- Preflight OPTIONS kini melewati rate limit umum (sebelumnya lolos).
+- HSTS dikirim bila request tiba lewat TLS langsung, atau bila
+  `FIM_TRUST_PROXY=1` dan `X-Forwarded-Proto: https` diterima. Apakah
+  Cloudflare Tunnel meneruskan header itu ke backend diverifikasi saat
+  deploy; bila tidak, HSTS tetap menjadi tanggung jawab edge Cloudflare
+  (lihat §Deployment).
+- Pesan galat pelepasan karantina tidak lagi membocorkan teks galat OS ke
+  klien (galat lengkap tetap di log server).
+- Berkas non-kode >50 MB yang dilewati kini dihitung di metrik
+  `skipped_oversize` dan dicatat di log (sebelumnya sepenuhnya diam).
+- `netguard` kini juga menolak `240.0.0.0/4` (reserved).
+- Kode mati yang dihapus: `ledger.GetAnomalyCount`/`GetBaselineTime`,
+  `config.Get()`, `middleware.JWTAuth`/`ValidateRequest`,
+  `helpers.isInternalIP`, `Scanner.CollectFiles`/`IsScanning`/`OnAnomaly`,
+  `metrics.Cycle.memPre`. `mem_alloc_bytes` adalah alokasi heap Go pada
+  AKHIR siklus, bukan alokasi selama siklus — penamaan metriknya diperbaiki
+  di dokumentasi ini agar tidak disalahartikan.
+
 ## Pengerasan v1.4.0
 
 - Webhook backup: client HTTP tidak lagi mengikuti redirect (redirect
@@ -267,9 +378,11 @@ dipulihkan bisa 0600 atau 0640).
   divalidasi ulang sesaat sebelum pengiriman, dan koneksi dibuat lewat
   dialer yang menolak alamat non-publik (loopback, privat, link-local,
   multicast, CGNAT `100.64.0.0/10`, `192.0.0.0/24`, benchmarking).
-  Sisa risiko: DNS dapat berubah antara validasi dial dan koneksi
-  (jendela milidetik); penerima webhook sebaiknya memverifikasi pengirim
-  lewat kanal terpisah karena POST webhook tidak membawa tanda tangan.
+  Sisa risiko di v1.4.0 — DNS dapat berubah antara validasi dial dan
+  koneksi (jendela milidetik), dan POST webhook tidak membawa tanda tangan
+  — keduanya DITUTUP di v1.5.0: dial memakai literal IP hasil satu kali
+  resolve, dan webhook membawa HMAC-SHA256 bila `FIM_WEBHOOK_SECRET`
+  di-set (lihat §Backup & notifikasi).
 - Rate limit login terpisah (10/menit/IP) dan `FIM_TRUST_PROXY` untuk
   deployment di belakang reverse proxy (lihat §Sesi dan autentikasi).
   IP klien diambil dari `CF-Connecting-IP` dulu (Cloudflare Tunnel),
@@ -285,7 +398,8 @@ dipulihkan bisa 0600 atau 0640).
   DELETED bila sebelumnya ada di baseline (juga bukan UNREADABLE — isinya
   memang tidak diperiksa; lihat §Batasan).
 - `UpdateSettings` parsial tidak lagi menghapus `backup_webhook_url` bila
-  field itu tidak dikirim (nil = biarkan, string kosong = hapus).
+  field itu tidak dikirim (nil = biarkan, string kosong = hapus). Sejak
+  v1.5.0 aturan yang sama berlaku untuk `telegram_chat_id`.
 - `StartMonitoring` menjepit interval di bawah 30 detik ke 30 detik, bukan
   diam-diam ke 300 detik. Perbandingan baseline memakai `worker_count`
   konfigurasi (sebelumnya hardcode 4 goroutine).
@@ -306,11 +420,13 @@ dipulihkan bisa 0600 atau 0640).
 Deteksi berjalan per siklus polling (`filepath.Walk` + `time.Ticker`,
 default kode 300 detik, minimal 30 detik, maksimal 86400 detik).
 `data/config.example.json` dan deployment produksi memakai 120 detik, jadi
-jeda deteksi maksimum di produksi adalah satu interval 120 detik. Yang
-real-time adalah pembaruan dashboard SETELAH deteksi, lewat SSE
-(`/api/v1/events`). Naskah dan presentasi harus memakai istilah ini
-secara tepat: "deteksi polling deterministik, notifikasi dashboard real-time
-via SSE", bukan "deteksi real-time".
+jeda deteksi maksimum di produksi adalah satu interval 120 detik DITAMBAH
+durasi satu siklus scan (sekitar 1 detik pada simulasi v1.2.0 dengan 3901
+berkas). Siklus pertama langsung berjalan saat monitoring dimulai, lalu
+mengikuti ticker. Yang real-time adalah pembaruan dashboard SETELAH
+deteksi, lewat SSE (`/api/v1/events`). Naskah dan presentasi harus memakai
+istilah ini secara tepat: "deteksi polling deterministik, notifikasi
+dashboard real-time via SSE", bukan "deteksi real-time".
 
 ## Deployment Linux dengan systemd
 
@@ -398,11 +514,15 @@ location /api/ {
 }
 ```
 
-HTTPS dan HSTS ditangani Cloudflare di depan Nginx (backend tidak pernah
-melihat TLS langsung, jadi backend tidak mengirim HSTS sendiri). Pastikan
-salah satu lapisan depan mengirim HSTS bila dashboard diakses publik.
-`CF-Connecting-IP` diteruskan Nginx apa adanya (header klien biasa, bukan
-hop-by-hop) dan dipakai backend sebagai IP klien bila `FIM_TRUST_PROXY=1`.
+HTTPS dan HSTS ditangani Cloudflare di depan Nginx. Sejak v1.5.0 backend
+juga mengirim `Strict-Transport-Security` bila request tiba lewat TLS
+langsung, atau bila `FIM_TRUST_PROXY=1` dan header `X-Forwarded-Proto:
+https` diterima. Apakah Cloudflare Tunnel meneruskan header itu ke backend
+diverifikasi saat deploy (periksa header respons API); bila tidak, HSTS
+tetap menjadi tanggung jawab edge Cloudflare — backend tidak mengklaim
+HSTS aktif tanpa bukti itu. `CF-Connecting-IP` diteruskan Nginx apa adanya
+(header klien biasa, bukan hop-by-hop) dan dipakai backend sebagai IP
+klien bila `FIM_TRUST_PROXY=1`.
 
 ### Batas Keamanan yang Jelas
 
@@ -423,18 +543,19 @@ localhost binding, dan backup off-host.
 ## API Utama
 
 Base URL: `http://127.0.0.1:8080/api/v1`. Rate limit umum 60 request/menit
-per-IP (burst 60); SSE `/events` tidak dihitung; body mutasi dibatasi 1 MB.
-Login dan setup awal memakai limiter terpisah 10 request/menit per-IP.
+per-IP (burst 60); SSE `/events` tidak dihitung; ukuran body request
+dibatasi 1 MB untuk SEMUA request (bukan hanya mutasi). Login dan setup
+awal memakai limiter terpisah 10 request/menit per-IP.
 
 | Method | Endpoint | Akses | Keterangan |
 | --- | --- | --- | --- |
 | GET | `/healthz` | Publik | Liveness (status, versi, uptime) |
 | POST | `/secure-gate` | Publik | Login; JWT hanya di cookie HttpOnly `fim_session`, bukan di body. Path default, dapat diubah lewat `login_path` di `config.json` (frontend meng-hardcode `/secure-gate`, jadi perubahan itu merusak login dashboard kecuali frontend ikut diubah) |
-| POST | `/setup` | Publik, sekali saja | Buat Super Admin pertama; 403 bila admin sudah ada |
-| POST | `/setup/auditor` | Super Admin | Buat/rotasi akun Auditor |
+| POST | `/setup` | Publik, sekali saja | Buat Super Admin pertama; 403 bila admin sudah ada; username wajib, password 8–72 karakter (400 bila tidak memenuhi) |
+| POST | `/setup/auditor` | Super Admin | Buat/rotasi akun Auditor; username wajib, password 8–72 karakter |
 | GET | `/auth/me` | Auditor + Super Admin | Identitas pemilik cookie sesi |
-| POST | `/auth/logout` | Auditor + Super Admin | Hapus cookie sesi (token tetap valid sampai kedaluwarsa/kredensial diubah) |
-| GET | `/dashboard/stats` | Auditor + Super Admin | Ringkasan baseline/anomali |
+| POST | `/auth/logout` | Auditor + Super Admin | Hapus cookie sesi; sejak v1.5.0 sesi ini juga dicabut di server (denylist `jti`) |
+| GET | `/dashboard/stats` | Auditor + Super Admin | Ringkasan baseline/anomali. Definisi: `safe_files` = berkas baseline yang saat ini TIDAK dikarantina (bukan bukti bersih); `total_anomalies` = jumlah kumulatif sepanjang waktu dari blok anomali (semua aksi kecuali `RELEASED`, termasuk `MODE_CHANGED` dan `UNREADABLE`); `total_blocks` mencakup `RELEASED`; `quarantined_files` = jumlah berkas yang sedang dikarantina |
 | GET | `/dashboard/status` | Auditor + Super Admin | Status monitoring/maintenance |
 | GET | `/ledger/blocks` | Auditor + Super Admin | Audit block terpaginasikan |
 | GET | `/ledger/verify` | Auditor + Super Admin | Verifikasi hash-chain |
@@ -444,16 +565,25 @@ Login dan setup awal memakai limiter terpisah 10 request/menit per-IP.
 | GET | `/events` | Auditor + Super Admin | SSE pembaruan dashboard (maks. 4 stream per IP, 64 total) |
 | GET | `/settings` | Auditor + Super Admin | Baca konfigurasi (Auditor tidak menerima `telegram_chat_id` dan `backup_webhook_url`) |
 | POST | `/settings` | Super Admin | Ubah konfigurasi |
-| POST | `/monitoring/start` | Super Admin | Mulai monitoring |
+| POST | `/monitoring/start` | Super Admin | Mulai monitoring; 409 bila sudah berjalan atau baseline kosong |
 | POST | `/monitoring/stop` | Super Admin | Hentikan monitoring |
 | POST | `/maintenance/enable` | Super Admin | Jeda scan dan karantina |
 | POST | `/maintenance/disable` | Super Admin | Lanjutkan operasi |
 | POST | `/baseline/init` | Super Admin | Buat baseline |
-| POST | `/baseline/update` | Super Admin | Perbarui baseline |
+| POST | `/baseline/update` | Super Admin | Perbarui baseline; 409 beserta daftar `quarantined_files` bila masih ada berkas dikarantina (sejak v1.5.0) |
 | GET | `/quarantine/list` | Auditor + Super Admin | Berkas yang sedang dikarantina |
-| POST | `/quarantine/release` | Super Admin | Release dengan audit block |
-| POST | `/backup/run` | Super Admin | Backup ledger manual |
-| POST | `/telegram/test` | Super Admin | Kirim pesan uji Telegram |
+| POST | `/quarantine/release` | Super Admin | Release dengan audit block; pesan galat ke klien generik sejak v1.5.0 |
+| POST | `/backup/run` | Super Admin | Backup ledger manual; gagal hanya bila Telegram dan webhook sama-sama gagal |
+| POST | `/telegram/test` | Super Admin | Kirim pesan uji Telegram; body opsional `telegram_token`/`telegram_chat_id` untuk menguji nilai yang belum disimpan |
+
+Catatan mode kegagalan dan paginasi: `/ledger/blocks` default limit 20,
+maks. 100; `/metrics` default limit 100, maks. 1000; metrik disimpan
+maks. 5000 siklus dan export ledger memuat 500 metrik terakhir.
+`mem_alloc_bytes` pada metrik adalah alokasi heap Go pada AKHIR siklus,
+bukan alokasi selama siklus. Webhook backup mengirim header
+`X-FIM-IPL-File` dan, bila `FIM_WEBHOOK_SECRET` di-set,
+`X-FIM-IPL-Signature` + `X-FIM-IPL-Timestamp` (lihat §Backup &
+notifikasi).
 
 Semua endpoint mutasi membutuhkan Super Admin, kecuali `POST
 /auth/logout` (semua role yang login) dan `POST /setup` (publik, hanya
@@ -513,10 +643,11 @@ go build ./...
 Kualitas repository dianggap siap bila seluruh command tersebut lolos.
 Sebelum rilis, jalankan juga `govulncheck ./...` pada toolchain yang sama
 dengan produksi dan catat hasilnya di pesan commit. Hasil `govulncheck`
-v1.4.0 (govulncheck v1.9.0, toolchain go1.27.3, 2026-11-05): 0 vuln yang
+v1.5.0 (govulncheck v1.9.0, toolchain go1.27.3, 2026-11-05): 0 vuln yang
 memengaruhi kode; 0 di paket yang diimpor; 1 vuln di modul yang dibutuhkan
-(`x/crypto`) tetapi tidak dipanggil kode ini. Dokumen ini tidak mengklaim
-"bebas vuln" secara absolut — yang diklaim hanya hasil pemindaian itu.
+(`x/crypto`) tetapi tidak dipanggil kode ini — sama seperti v1.4.0.
+Dokumen ini tidak mengklaim "bebas vuln" secara absolut — yang diklaim
+hanya hasil pemindaian itu.
 
 ## Batasan yang Harus Dipahami
 
@@ -530,15 +661,26 @@ memengaruhi kode; 0 di paket yang diimpor; 1 vuln di modul yang dibutuhkan
   anomali; bila sebelumnya ada di baseline, file itu tidak dianggap
   terhapus (bukan DELETED, bukan UNREADABLE) — isinya memang tidak
   diperiksa. File kode (termasuk double extension `.php.*`) tetap dipindai
-  berapa pun ukurannya.
-- Logout tidak mencabut token di sisi server; token tetap valid sampai
-  kedaluwarsa 24 jam atau sampai kredensial diubah (yang menaikkan
-  `session_epoch`).
-- POST webhook backup tidak membawa tanda tangan pengirim; penerima tidak
-  dapat membedakan export asli dari POST palsu. Validasi URL dilakukan saat
-  menyimpan, saat boot, dan sesaat sebelum pengiriman, dan redirect tidak
-  diikuti — tetapi DNS rebinding pada jendela antara validasi dial dan
-  koneksi masih merupakan risiko residual.
+  berapa pun ukurannya. Jumlah berkas yang dilewati tercatat di metrik
+  `skipped_oversize` setiap siklus (sejak v1.5.0).
+- Logout mencabut sesi itu di sisi server (denylist `jti`) sejak v1.5.0;
+  token yang diterbitkan sebelum v1.5.0 (tanpa `jti`) hanya batal bila
+  kredensial diubah (yang menaikkan `session_epoch`).
+- POST webhook backup membawa tanda tangan HMAC-SHA256 bila
+  `FIM_WEBHOOK_SECRET` di-set; tanpa secret, penerima tidak dapat
+  membedakan export asli dari POST palsu. Validasi URL dilakukan saat
+  menyimpan, saat boot, dan sesaat sebelum pengiriman, redirect tidak
+  diikuti, dan dial memakai literal IP hasil satu kali resolve — jendela
+  DNS rebinding antara validasi dial dan koneksi sudah ditutup di v1.5.0.
+- Token bot Telegram dikirim sebagai bagian dari path URL Bot API oleh
+  desain Telegram sendiri; galat transport di-redact agar token tidak
+  bocor ke log, tetapi token yang pernah dibagikan (mis. ditempel di chat)
+  harus dirotasi lewat BotFather setelah demo skripsi.
+- Direktori yang berupa symlink TIDAK pernah ditelusuri (Walk memakai
+  Lstat): perubahan di dalam subtree symlink tidak terdeteksi, dan
+  dedup membungkamnya agar tidak membanjiri ledger. Ini batasan yang
+  didokumentasikan, bukan yang diikuti diam-diam — jangan mengandalkan
+  pemantauan lewat symlink direktori.
 - Formula hash blok menggabungkan field dengan pemisah `|` tanpa escaping;
   secara teoretis dua kombinasi field berbeda dapat menghasilkan string
   pra-hash yang sama bila path mengandung `|`. Praktiknya dapat diabaikan

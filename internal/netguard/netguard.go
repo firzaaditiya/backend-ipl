@@ -18,8 +18,9 @@ import (
 // IsLinkLocal bawaan Go, agar penolakan tidak bergantung pada satu definisi
 // bawaan saja: CGNAT (100.64.0.0/10, RFC 6598), 192.0.0.0/24 (RFC 6890,
 // termasuk 192.0.0.170/171), rentang benchmarking (198.18.0.0/15, RFC 2544),
-// dan tiga rentang dokumentasi TEST-NET (RFC 5737) yang tidak pernah dapat
-// dirutekan publik.
+// tiga rentang dokumentasi TEST-NET (RFC 5737) yang tidak pernah dapat
+// dirutekan publik, dan rentang reserved 240.0.0.0/4 (RFC 1112, termasuk
+// 255.255.255.255) yang juga tidak dicakup IsPrivate Go.
 var nonPublicNetworks = []net.IPNet{
 	{IP: net.ParseIP("100.64.0.0"), Mask: net.CIDRMask(10, 32)},
 	{IP: net.ParseIP("192.0.0.0"), Mask: net.CIDRMask(24, 32)},
@@ -27,6 +28,7 @@ var nonPublicNetworks = []net.IPNet{
 	{IP: net.ParseIP("198.18.0.0"), Mask: net.CIDRMask(15, 32)},
 	{IP: net.ParseIP("198.51.100.0"), Mask: net.CIDRMask(24, 32)},
 	{IP: net.ParseIP("203.0.113.0"), Mask: net.CIDRMask(24, 32)},
+	{IP: net.ParseIP("240.0.0.0"), Mask: net.CIDRMask(4, 32)},
 }
 
 // IsInternalIP melaporkan apakah sebuah alamat IP tidak boleh menjadi tujuan

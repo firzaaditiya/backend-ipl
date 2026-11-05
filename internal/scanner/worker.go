@@ -14,16 +14,33 @@ type CompareResult struct {
 	Created    []models.AnomalyEvent
 	Deleted    []models.AnomalyEvent
 	Unreadable []models.AnomalyEvent
+	// ModeChanged mencatat perubahan izin (chmod) yang isinya tidak berubah.
+	ModeChanged []models.AnomalyEvent
+	// ModeAdoptions adalah path baseline lama (Mode == 0, dari sebelum
+	// v1.5.0) yang modenya teramati pada siklus ini. Caller wajib menulis
+	// adopsi ini ke baseline (AdoptBaselineModes) agar perubahan izin
+	// pada siklus berikutnya benar-benar terdeteksi, tanpa menimbulkan
+	// event palsu pada siklus pertama setelah upgrade.
+	ModeAdoptions map[string]uint32
+	// SkippedOversize menghitung file non-kode >50 MB yang dilewati pada
+	// siklus ini (isinya tidak diperiksa).
+	SkippedOversize int
 }
 
 // CompareWithBaseline membandingkan hasil scan dengan baseline. workers
 // adalah jumlah goroutine pembanding (<= 0 berarti default 4); nilai ini
 // berasal dari konfigurasi scanner agar konsisten dengan worker hashing.
+//
+// Perbandingan memakai hash DAN mode (izin berkas). Perubahan mode saja —
+// mis. chmod 777 pada file konfigurasi — menghasilkan MODE_CHANGED; hash
+// yang sama dengan mode yang sama berarti tidak ada temuan. Baseline lama
+// yang belum mencatat mode (Mode == 0) tidak menghasilkan event pada
+// siklus pertama: modenya diadopsi diam-diam lewat ModeAdoptions.
 func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]models.FileRecord, workers int) *CompareResult {
 	if workers <= 0 {
 		workers = 4
 	}
-	result := &CompareResult{}
+	result := &CompareResult{ModeAdoptions: make(map[string]uint32)}
 	var mu sync.Mutex
 
 	scannedMap := make(map[string]models.ScanResult, len(scanResults))
@@ -59,9 +76,16 @@ func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]mo
 					}()
 					scanned, exists := scannedMap[record.Path]
 					if !exists {
-						if _, skipped := skippedMap[record.Path]; skipped {
+						if skipped, isSkipped := skippedMap[record.Path]; isSkipped {
 							// File ada tetapi tidak di-hash karena batas
 							// ukuran: bukan DELETED, bukan UNREADABLE.
+							// Izinnya tetap teramati, jadi adopsi mode
+							// untuk baseline lama tetap bisa dilakukan.
+							if record.Mode == 0 && skipped.Mode != 0 {
+								mu.Lock()
+								result.ModeAdoptions[record.Path] = skipped.Mode
+								mu.Unlock()
+							}
 							return
 						}
 						if failed, unreadable := errorMap[record.Path]; unreadable {
@@ -73,6 +97,8 @@ func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]mo
 								FilePath: record.Path,
 								Action:   models.ActionUnreadable,
 								OldHash:  record.Hash,
+								OldMode:  record.Mode,
+								NewMode:  failed.Mode,
 								ScanErr:  failed.Err.Error(),
 							})
 							mu.Unlock()
@@ -82,6 +108,7 @@ func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]mo
 								FilePath: record.Path,
 								Action:   models.ActionDeleted,
 								OldHash:  record.Hash,
+								OldMode:  record.Mode,
 								NewHash:  "",
 							})
 							mu.Unlock()
@@ -93,6 +120,30 @@ func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]mo
 							Action:   models.ActionModified,
 							OldHash:  record.Hash,
 							NewHash:  scanned.Hash,
+							OldMode:  record.Mode,
+							NewMode:  scanned.Mode,
+						})
+						mu.Unlock()
+					} else if record.Mode == 0 {
+						// Baseline dari sebelum v1.5.0 belum mencatat mode.
+						// Adopsi mode yang teramati tanpa event agar 3901
+						// file lama tidak sekaligus dilaporkan berubah.
+						if scanned.Mode != 0 {
+							mu.Lock()
+							result.ModeAdoptions[record.Path] = scanned.Mode
+							mu.Unlock()
+						}
+					} else if scanned.Mode != record.Mode {
+						// Isi sama, izin berubah: tetap anomali integritas.
+						// OldHash == NewHash karena hash tidak berubah.
+						mu.Lock()
+						result.ModeChanged = append(result.ModeChanged, models.AnomalyEvent{
+							FilePath: record.Path,
+							Action:   models.ActionModeChanged,
+							OldHash:  scanned.Hash,
+							NewHash:  scanned.Hash,
+							OldMode:  record.Mode,
+							NewMode:  scanned.Mode,
 						})
 						mu.Unlock()
 					}
@@ -114,6 +165,7 @@ func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]mo
 				Action:   models.ActionCreated,
 				OldHash:  "",
 				NewHash:  sr.Hash,
+				NewMode:  sr.Mode,
 			})
 		}
 	}
@@ -128,9 +180,12 @@ func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]mo
 		result.Unreadable = append(result.Unreadable, models.AnomalyEvent{
 			FilePath: path,
 			Action:   models.ActionUnreadable,
+			NewMode:  sr.Mode,
 			ScanErr:  sr.Err.Error(),
 		})
 	}
+
+	result.SkippedOversize = len(skippedMap)
 
 	// Urutkan secara deterministik: ledger dan laporan menjadi reprodusibel.
 	sort.Slice(result.Modified, func(i, j int) bool {
@@ -142,24 +197,28 @@ func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]mo
 	sort.Slice(result.Deleted, func(i, j int) bool {
 		return result.Deleted[i].FilePath < result.Deleted[j].FilePath
 	})
+	sort.Slice(result.ModeChanged, func(i, j int) bool {
+		return result.ModeChanged[i].FilePath < result.ModeChanged[j].FilePath
+	})
 	sort.Slice(result.Unreadable, func(i, j int) bool {
 		return result.Unreadable[i].FilePath < result.Unreadable[j].FilePath
 	})
 
-	log.Printf("[Scanner] Comparison done: %d modified, %d created, %d deleted, %d unreadable",
-		len(result.Modified), len(result.Created), len(result.Deleted), len(result.Unreadable))
+	log.Printf("[Scanner] Comparison done: %d modified, %d created, %d mode-changed, %d deleted, %d unreadable, %d skipped (oversize)",
+		len(result.Modified), len(result.Created), len(result.ModeChanged), len(result.Deleted), len(result.Unreadable), result.SkippedOversize)
 
 	return result
 }
 
 func (cr *CompareResult) TotalAnomalies() int {
-	return len(cr.Modified) + len(cr.Created) + len(cr.Deleted) + len(cr.Unreadable)
+	return len(cr.Modified) + len(cr.Created) + len(cr.ModeChanged) + len(cr.Deleted) + len(cr.Unreadable)
 }
 
 func (cr *CompareResult) AllEvents() []models.AnomalyEvent {
 	events := make([]models.AnomalyEvent, 0, cr.TotalAnomalies())
 	events = append(events, cr.Modified...)
 	events = append(events, cr.Created...)
+	events = append(events, cr.ModeChanged...)
 	events = append(events, cr.Unreadable...)
 	events = append(events, cr.Deleted...)
 	return events

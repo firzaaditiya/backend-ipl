@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+
+	"github.com/skripsi/fim-ipl/internal/fsx"
 )
 
 // Result menggambarkan hasil upaya karantina.
@@ -60,7 +62,14 @@ func Apply(path string) Result {
 
 	res.OriginalMode = info.Mode().Perm()
 
-	if err := os.Chmod(path, 0o000); err != nil {
+	// Chmod tanpa mengikuti symlink: fsx.ChmodNoFollow membuka file
+	// dengan O_PATH|O_NOFOLLOW lalu chmod lewat /proc/self/fd/<fd>,
+	// sehingga tidak ada jendela di mana symlink bisa ditukar di antara
+	// Lstat dan chmod. (fchmodat2 sempat dicoba di v1.5.0 tetapi tidak
+	// tersedia: syscall-nya diblokir filter kernel container ini.)
+	// Bekerja juga pada file 0600 milik www-data (CAP_FOWNER memberi hak
+	// chmod, bukan hak baca) karena tidak perlu membuka file untuk dibaca.
+	if err := fsx.ChmodNoFollow(path, 0o000); err != nil {
 		res.Err = fmt.Errorf("chmod 000: %w", err)
 		return res
 	}
@@ -102,7 +111,8 @@ func Release(path string, mode os.FileMode) error {
 	if info.IsDir() {
 		return fmt.Errorf("target is a directory")
 	}
-	if err := os.Chmod(path, mode); err != nil {
+	// Sama seperti Apply: chmod tanpa mengikuti symlink.
+	if err := fsx.ChmodNoFollow(path, mode); err != nil {
 		return fmt.Errorf("chmod %04o: %w", mode, err)
 	}
 	// Verifikasi pelepasan yang sama seperti pada Apply (v1.2.0): pelepasan

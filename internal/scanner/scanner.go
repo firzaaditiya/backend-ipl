@@ -13,13 +13,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/skripsi/fim-ipl/internal/fsx"
 	"github.com/skripsi/fim-ipl/internal/models"
 )
 
 type Scanner struct {
 	workerCount     int
 	watchPaths      []string
-	intervalSec     int
 	mu              sync.RWMutex
 	isRunning       bool
 	isScanning      bool
@@ -28,12 +28,10 @@ type Scanner struct {
 	intervalCh      chan int
 	wg              sync.WaitGroup
 	scanCycleFn     func()
-	OnAnomaly       func(event models.AnomalyEvent)
 }
 
 const (
 	defaultWorkerCount = 4
-	defaultIntervalSec = 300
 	minIntervalSec     = 30
 	maxIntervalSec     = 86400
 )
@@ -45,7 +43,6 @@ func New(workerCount int, watchPaths []string) *Scanner {
 	return &Scanner{
 		workerCount: workerCount,
 		watchPaths:  watchPaths,
-		intervalSec: defaultIntervalSec,
 		stopChan:    make(chan struct{}),
 		intervalCh:  make(chan int, 1),
 	}
@@ -68,7 +65,11 @@ func (s *Scanner) IsMaintenance() bool {
 }
 
 func HashFile(path string) (string, error) {
-	f, err := os.Open(path)
+	// O_NOFOLLOW (Linux): symlink ditolak saat open, bukan hanya saat
+	// Lstat — menutup jendela TOCTOU antara Walk dan hashing, ketika
+	// penyerang bisa menukar file biasa menjadi symlink ke target di luar
+	// watch path. Di platform lain, open biasa (lihat internal/fsx).
+	f, err := fsx.OpenReadNoFollow(path)
 	if err != nil {
 		return "", err
 	}
@@ -92,15 +93,10 @@ const maxScanFileSize = 50 * 1024 * 1024
 // Batasan ini didokumentasikan di README sebagai keterbatasan yang diketahui.
 var ErrFileOversize = errors.New("file melebihi batas pindai 50 MB (non-kode); tidak di-hash")
 
-// CollectFiles mengembalikan path file yang akan di-hash. File yang tidak
-// dapat dibaca atau berupa symlink TIDAK diikuti; keduanya dikembalikan oleh
-// collectFiles sebagai hasil ber-error agar bisa dilaporkan sebagai
-// UNREADABLE, bukan dianggap DELETED.
-func (s *Scanner) CollectFiles() ([]string, error) {
-	files, _, err := s.collectFiles()
-	return files, err
-}
-
+// collectFiles mengembalikan path file yang akan di-hash. File yang tidak
+// dapat dibaca atau berupa symlink TIDAK diikuti; keduanya dikembalikan
+// sebagai hasil ber-error agar bisa dilaporkan sebagai UNREADABLE, bukan
+// dianggap DELETED.
 func (s *Scanner) collectFiles() ([]string, []models.ScanResult, error) {
 	s.mu.RLock()
 	paths := make([]string, len(s.watchPaths))
@@ -153,6 +149,10 @@ func (s *Scanner) collectFiles() ([]string, []models.ScanResult, error) {
 			if info.Size() > maxScanFileSize && !isCodeLike(path) {
 				rejected = append(rejected, models.ScanResult{
 					Path: path,
+					// Izin tetap teramati walau isi tidak di-hash, agar
+					// perubahan mode file oversize tetap bisa diadopsi
+					// baseline atau dilaporkan pada siklus berikutnya.
+					Mode: uint32(info.Mode().Perm()),
 					Err:  fmt.Errorf("%w (%d byte)", ErrFileOversize, info.Size()),
 				})
 				return nil
@@ -245,21 +245,34 @@ func (s *Scanner) worker(jobs <-chan string, results chan<- models.ScanResult, w
 				}
 			}()
 
-			info, err := os.Stat(path)
+			// Lstat (bukan Stat): symlink ditolak di sini, sebelum HashFile.
+			// Mode dicatat dari Lstat agar perubahan izin terdeteksi walau
+			// hashing gagal (mis. file mode 0600 milik www-data).
+			info, err := os.Lstat(path)
 			if err != nil {
 				results <- models.ScanResult{Path: path, Err: err}
+				return
+			}
+			mode := uint32(info.Mode().Perm())
+			if info.Mode()&os.ModeSymlink != 0 {
+				results <- models.ScanResult{
+					Path: path,
+					Mode: mode,
+					Err:  errors.New("symlink tidak dipindai (target di luar watch path)"),
+				}
 				return
 			}
 
 			hash, err := HashFile(path)
 			if err != nil {
-				results <- models.ScanResult{Path: path, Err: err}
+				results <- models.ScanResult{Path: path, Mode: mode, Err: err}
 				return
 			}
 
 			results <- models.ScanResult{
 				Path:    path,
 				Hash:    hash,
+				Mode:    mode,
 				Size:    info.Size(),
 				ModTime: info.ModTime(),
 			}
@@ -281,14 +294,6 @@ func (s *Scanner) IsRunning() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.isRunning
-}
-
-// IsScanning mengembalikan true jika ada siklus scan (manual/ticker) yang
-// sedang berjalan.
-func (s *Scanner) IsScanning() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.isScanning
 }
 
 // TryStartScan mencoba memulai scan. Return false jika scan sebelumnya masih berjalan.
@@ -326,7 +331,6 @@ func (s *Scanner) StartMonitoring(intervalSec int) {
 		return
 	}
 	s.isRunning = true
-	s.intervalSec = intervalSec
 	stopCh := make(chan struct{})
 	s.stopChan = stopCh
 	cycleFn := s.scanCycleFn
@@ -393,9 +397,6 @@ func (s *Scanner) UpdateConfig(workerCount int, watchPaths []string, intervalSec
 	}
 	if len(watchPaths) > 0 {
 		s.watchPaths = watchPaths
-	}
-	if intervalSec >= minIntervalSec && intervalSec <= maxIntervalSec {
-		s.intervalSec = intervalSec
 	}
 	running := s.isRunning
 	s.mu.Unlock()

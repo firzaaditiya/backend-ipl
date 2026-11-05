@@ -122,3 +122,59 @@ func TestParseClaimsAcceptsCurrentSessionEpoch(t *testing.T) {
 		t.Fatalf("expected session epoch 3, got %d", claims.SessionEpoch)
 	}
 }
+
+func TestGenerateTokenIncludesJTI(t *testing.T) {
+	token, _, err := GenerateToken("user", RoleSuperAdmin, testSecret, 1, 0)
+	if err != nil {
+		t.Fatalf("GenerateToken: %v", err)
+	}
+	claims, ok := ParseClaims(requestWithToken(token), testSecret, 0)
+	if !ok {
+		t.Fatal("expected valid claims")
+	}
+	if claims.ID == "" {
+		t.Fatal("expected a non-empty jti on every token")
+	}
+	// Dua token untuk user yang sama harus punya jti berbeda.
+	token2, _, err := GenerateToken("user", RoleSuperAdmin, testSecret, 1, 0)
+	if err != nil {
+		t.Fatalf("GenerateToken: %v", err)
+	}
+	claims2, ok := ParseClaims(requestWithToken(token2), testSecret, 0)
+	if !ok {
+		t.Fatal("expected valid claims for second token")
+	}
+	if claims2.ID == claims.ID {
+		t.Fatal("two tokens must not share the same jti")
+	}
+}
+
+func TestParseClaimsWithRevocationRejectsRevokedJTI(t *testing.T) {
+	token, _, err := GenerateToken("user", RoleSuperAdmin, testSecret, 1, 0)
+	if err != nil {
+		t.Fatalf("GenerateToken: %v", err)
+	}
+	claims, ok := ParseClaims(requestWithToken(token), testSecret, 0)
+	if !ok {
+		t.Fatal("expected valid claims")
+	}
+	revoked := map[string]bool{claims.ID: true}
+	isRevoked := func(jti string) bool { return revoked[jti] }
+
+	if _, ok := ParseClaimsWithRevocation(requestWithToken(token), testSecret, 0, isRevoked); ok {
+		t.Fatal("revoked token must be rejected")
+	}
+	// Token lain (jti berbeda) tetap diterima.
+	token2, _, err := GenerateToken("user", RoleSuperAdmin, testSecret, 1, 0)
+	if err != nil {
+		t.Fatalf("GenerateToken: %v", err)
+	}
+	if _, ok := ParseClaimsWithRevocation(requestWithToken(token2), testSecret, 0, isRevoked); !ok {
+		t.Fatal("non-revoked token must still be accepted")
+	}
+	// Tanpa checker (nil), token yang dicabut tetap lolos — pemakaian
+	// ini hanya untuk jalur yang memang tidak memakai denylist.
+	if _, ok := ParseClaimsWithRevocation(requestWithToken(token), testSecret, 0, nil); !ok {
+		t.Fatal("nil revocation checker must not reject anything")
+	}
+}

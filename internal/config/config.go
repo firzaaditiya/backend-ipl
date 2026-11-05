@@ -39,11 +39,19 @@ type Config struct {
 
 	// SessionEpoch adalah versi sesi: setiap perubahan kredensial
 	// (SetupPassword / SetupAuditor) menaikkannya satu tingkat, sehingga
-	// seluruh token JWT yang diterbitkan sebelumnya ditolak. Logout sendiri
-	// TIDAK mencabut token di sisi server (token tetap valid sampai
-	// kedaluwarsa 24 jam atau sampai kredensial diubah); ini batasan yang
-	// dinyatakan di README, bukan celah yang disembunyikan.
+	// seluruh token JWT yang diterbitkan sebelumnya ditolak. Logout juga
+	// mencabut token itu saja lewat denylist jti (sejak v1.5.0, lihat
+	// ledger.RevokeToken); token yang sudah logout tidak lagi valid walau
+	// belum kedaluwarsa 24 jam.
 	SessionEpoch int `json:"session_epoch"`
+
+	// WebhookSecret adalah secret HMAC untuk menandatangani export ledger
+	// ke webhook (header X-FIM-IPL-Signature). Hanya dari environment
+	// (FIM_WEBHOOK_SECRET); TIDAK PERNAH ditulis ke config.json (json:"-"
+	// di struct ini dan di Snapshot) dan tidak bisa diubah lewat Settings
+	// API. Kosong = webhook dikirim tanpa tanda tangan (penerima tidak
+	// bisa membedakan export asli dari POST palsu).
+	WebhookSecret string `json:"-"`
 
 	AdminUsername string `json:"admin_username"`
 	AdminPassword string `json:"admin_password"`
@@ -192,7 +200,8 @@ func Load(path string) (*Config, error) {
 //	FIM_ADMIN_USERNAME, FIM_ADMIN_PASSWORD,
 //	FIM_AUDITOR_USERNAME, FIM_AUDITOR_PASSWORD,
 //	FIM_TELEGRAM_TOKEN, FIM_TELEGRAM_CHAT_ID,
-//	FIM_BACKUP_WEBHOOK_URL,
+//	FIM_BACKUP_WEBHOOK_URL, FIM_WEBHOOK_SECRET (secret HMAC webhook;
+//	tidak pernah ditulis ke config.json),
 //	FIM_SCAN_INTERVAL_SEC (30-86400), FIM_WORKER_COUNT (1-16),
 //	FIM_ALLOWED_ORIGINS (dipisah koma),
 //	FIM_COOKIE_SECURE ("1"/"true" atau "0"/"false")
@@ -250,6 +259,12 @@ func applyEnvOverrides(c *Config) {
 		c.BackupWebhookURL = v
 		markEnv(c, "backup_webhook_url")
 	}
+	// Secret HMAC webhook: env-only, tidak di-mark sebagai env override
+	// karena field ini tidak pernah dipersist (json:"-" di Config dan
+	// Snapshot), jadi Persist tidak akan pernah menuliskannya ke disk.
+	if v := os.Getenv("FIM_WEBHOOK_SECRET"); v != "" {
+		c.WebhookSecret = v
+	}
 	if v := os.Getenv("FIM_SCAN_INTERVAL_SEC"); v != "" {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 30 && n <= 86400 {
 			c.ScanIntervalSec = n
@@ -299,10 +314,6 @@ func generateRandomSecret() (string, error) {
 		return "", fmt.Errorf("cannot generate random JWT secret: %w", err)
 	}
 	return hex.EncodeToString(b), nil
-}
-
-func Get() *Config {
-	return instance
 }
 
 func Save(path string, cfg *Config) error {
@@ -430,6 +441,7 @@ type Snapshot struct {
 	CookieSecure      bool     `json:"cookie_secure"`
 	MonitoringEnabled bool     `json:"monitoring_enabled"`
 	SessionEpoch      int      `json:"session_epoch"`
+	WebhookSecret     string   `json:"-"`
 	AdminUsername     string   `json:"admin_username"`
 	AdminPassword     string   `json:"admin_password"`
 	AuditorUsername   string   `json:"auditor_username"`
@@ -461,6 +473,7 @@ func (c *Config) Snapshot() Snapshot {
 		CookieSecure:      c.CookieSecure,
 		MonitoringEnabled: c.MonitoringEnabled,
 		SessionEpoch:      c.SessionEpoch,
+		WebhookSecret:     c.WebhookSecret,
 		AdminUsername:     c.AdminUsername,
 		AdminPassword:     c.AdminPassword,
 		AuditorUsername:   c.AuditorUsername,

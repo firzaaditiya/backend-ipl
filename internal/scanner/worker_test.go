@@ -160,3 +160,84 @@ func TestCompareWithBaselineRespectsWorkerCount(t *testing.T) {
 		t.Fatalf("expected 0 anomalies with 1 worker, got %+v", res)
 	}
 }
+
+func TestCompareModeOnlyChangeIsModeChanged(t *testing.T) {
+	baseline := map[string]models.FileRecord{
+		"/w/wp-config.php": {Path: "/w/wp-config.php", Hash: "h", Mode: 0o644},
+	}
+	scanned := sr("/w/wp-config.php", "h")
+	scanned.Mode = 0o777
+
+	res := CompareWithBaseline([]models.ScanResult{scanned}, baseline, 2)
+
+	if len(res.ModeChanged) != 1 {
+		t.Fatalf("expected 1 mode-changed, got %+v", res)
+	}
+	ev := res.ModeChanged[0]
+	if ev.Action != models.ActionModeChanged || ev.OldMode != 0o644 || ev.NewMode != 0o777 {
+		t.Fatalf("unexpected mode-changed event: %+v", ev)
+	}
+	if ev.OldHash != "h" || ev.NewHash != "h" {
+		t.Fatalf("mode-only change must keep the same hash: %+v", ev)
+	}
+	if len(res.Modified) != 0 || res.TotalAnomalies() != 1 {
+		t.Fatalf("mode-only change must not be MODIFIED: %+v", res)
+	}
+	if len(res.AllEvents()) != 1 || res.AllEvents()[0].Action != models.ActionModeChanged {
+		t.Fatalf("AllEvents must include MODE_CHANGED: %+v", res.AllEvents())
+	}
+}
+
+func TestCompareModeAdoptionForLegacyBaseline(t *testing.T) {
+	// Baseline dari sebelum v1.5.0 tidak mencatat mode (Mode == 0):
+	// siklus pertama mengadopsi mode tanpa event.
+	baseline := map[string]models.FileRecord{
+		"/w/legacy.php": {Path: "/w/legacy.php", Hash: "h"},
+	}
+	scanned := sr("/w/legacy.php", "h")
+	scanned.Mode = 0o644
+
+	res := CompareWithBaseline([]models.ScanResult{scanned}, baseline, 2)
+
+	if res.TotalAnomalies() != 0 {
+		t.Fatalf("legacy baseline must not produce an event on first cycle: %+v", res)
+	}
+	if got, ok := res.ModeAdoptions["/w/legacy.php"]; !ok || got != 0o644 {
+		t.Fatalf("expected mode adoption 0644, got %v (ok=%v)", got, ok)
+	}
+}
+
+func TestCompareModeChangePlusHashChangeIsModified(t *testing.T) {
+	baseline := map[string]models.FileRecord{
+		"/w/a.php": {Path: "/w/a.php", Hash: "old", Mode: 0o644},
+	}
+	scanned := sr("/w/a.php", "new")
+	scanned.Mode = 0o600
+
+	res := CompareWithBaseline([]models.ScanResult{scanned}, baseline, 2)
+
+	if len(res.Modified) != 1 || len(res.ModeChanged) != 0 {
+		t.Fatalf("hash+mode change must be a single MODIFIED: %+v", res)
+	}
+	if res.Modified[0].OldMode != 0o644 || res.Modified[0].NewMode != 0o600 {
+		t.Fatalf("MODIFIED must record both modes: %+v", res.Modified[0])
+	}
+}
+
+func TestCompareSkippedOversizeIsCounted(t *testing.T) {
+	baseline := map[string]models.FileRecord{
+		"/w/big.mp4": {Path: "/w/big.mp4", Hash: "old", Mode: 0o644},
+	}
+	results := []models.ScanResult{
+		{Path: "/w/big.mp4", Mode: 0o644, Err: ErrFileOversize},
+	}
+
+	res := CompareWithBaseline(results, baseline, 2)
+
+	if res.SkippedOversize != 1 {
+		t.Fatalf("expected 1 skipped oversize, got %d", res.SkippedOversize)
+	}
+	if res.TotalAnomalies() != 0 {
+		t.Fatalf("oversize file must not be an anomaly: %+v", res)
+	}
+}

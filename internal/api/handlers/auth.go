@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/skripsi/fim-ipl/internal/api/middleware"
 	"github.com/skripsi/fim-ipl/internal/config"
+	"github.com/skripsi/fim-ipl/internal/ledger"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -24,11 +27,33 @@ func init() {
 
 type AuthHandler struct {
 	cfg     *config.Config
+	ledger  *ledger.Ledger
 	setupMu sync.Mutex
 }
 
-func NewAuthHandler(cfg *config.Config) *AuthHandler {
-	return &AuthHandler{cfg: cfg}
+func NewAuthHandler(cfg *config.Config, l *ledger.Ledger) *AuthHandler {
+	return &AuthHandler{cfg: cfg, ledger: l}
+}
+
+// parseClaims memvalidasi cookie sesi termasuk denylist logout (jti).
+// Ledger boleh nil pada pengujian yang tidak memakai pencabutan token.
+func (h *AuthHandler) parseClaims(r *http.Request) (*middleware.Claims, bool) {
+	snap := h.cfg.Snapshot()
+	return middleware.ParseClaimsWithRevocation(r, snap.JWTSecret, snap.SessionEpoch, func(jti string) bool {
+		if h.ledger == nil {
+			return false
+		}
+		return h.ledger.IsTokenRevoked(jti)
+	})
+}
+
+// truncateLogValue membatasi panjang nilai yang ditulis ke log agar satu
+// baris log tidak bisa membengkak sampai 1 MB (batas body request).
+func truncateLogValue(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
 
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
@@ -72,12 +97,13 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	if role == "" {
 		// Samakan pesan error agar tidak membocorkan user mana yang valid.
 		// Username dan IP dicatat (tanpa password) agar brute force
-		// meninggalkan jejak di log untuk insiden response.
-		log.Printf("[Auth] Login failed for user %q from %s", req.Username, middleware.ClientIP(r))
+		// meninggalkan jejak di log untuk insiden response. Username
+		// dipotong 64 karakter agar baris log tidak membengkak.
+		log.Printf("[Auth] Login failed for user %q from %s", truncateLogValue(req.Username, 64), middleware.ClientIP(r))
 		http.Error(w, `{"error":"invalid credentials"}`, http.StatusUnauthorized)
 		return
 	}
-	log.Printf("[Auth] Login succeeded for user %q (role=%s) from %s", req.Username, role, middleware.ClientIP(r))
+	log.Printf("[Auth] Login succeeded for user %q (role=%s) from %s", truncateLogValue(req.Username, 64), role, middleware.ClientIP(r))
 
 	token, expiresAt, err := middleware.GenerateToken(req.Username, role, snap.JWTSecret, 24, snap.SessionEpoch)
 	if err != nil {
@@ -99,13 +125,28 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Logout menghapus cookie sesi di browser. Endpoint ini sengaja tetap
+// Logout menghapus cookie sesi di browser DAN mencabut token itu di sisi
+// server (denylist jti, sejak v1.5.0): token yang sudah logout tidak lagi
+// bisa dipakai walau belum kedaluwarsa 24 jam. Endpoint ini sengaja tetap
 // terproteksi (butuh cookie valid): logout tanpa sesi tidak ada artinya,
 // dan frontend selalu membersihkan state lokalnya walau respons ini 401.
 func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
+	}
+
+	// Cabut token saat ini sebelum menghapus cookie. Token tanpa jti
+	// (diterbitkan sebelum v1.5.0) tidak bisa dicabut satu-per-satu;
+	// logout-nya tetap menghapus cookie seperti sebelumnya.
+	if claims, ok := h.parseClaims(r); ok && claims.ID != "" && h.ledger != nil {
+		expiresAt := time.Now().Add(24 * time.Hour)
+		if claims.ExpiresAt != nil {
+			expiresAt = claims.ExpiresAt.Time
+		}
+		if err := h.ledger.RevokeToken(claims.ID, expiresAt); err != nil {
+			log.Printf("[Auth] Failed to revoke token on logout: %v", err)
+		}
 	}
 
 	snap := h.cfg.Snapshot()
@@ -124,8 +165,7 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snap := h.cfg.Snapshot()
-	claims, ok := middleware.ParseClaims(r, snap.JWTSecret, snap.SessionEpoch)
+	claims, ok := h.parseClaims(r)
 	if !ok {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
@@ -161,13 +201,16 @@ func (h *AuthHandler) SetupAuditor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Username == "" || len(req.Password) < 8 {
-		http.Error(w, `{"error":"username required and password min 8 chars"}`, http.StatusBadRequest)
+	// Bcrypt menolak password >72 byte dengan galat generik; validasi di
+	// sini agar klien mendapat 400 yang jelas, bukan 500 "failed to hash".
+	username := strings.TrimSpace(req.Username)
+	if username == "" || len(req.Password) < 8 || len(req.Password) > 72 {
+		http.Error(w, `{"error":"username required and password must be 8-72 characters"}`, http.StatusBadRequest)
 		return
 	}
 
 	snap := h.cfg.Snapshot()
-	if req.Username == snap.AdminUsername {
+	if username == snap.AdminUsername {
 		http.Error(w, `{"error":"username already taken by admin"}`, http.StatusConflict)
 		return
 	}
@@ -178,19 +221,28 @@ func (h *AuthHandler) SetupAuditor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Simpan nilai lama agar gagal persist bisa di-rollback: tanpa ini,
+	// memori dan disk berbeda dan percobaan ulang kena 403 karena
+	// IsAdminConfigured()/epoch membaca memori.
+	old := h.cfg.Snapshot()
 	h.cfg.Update(func(c *config.Config) {
-		c.AuditorUsername = req.Username
+		c.AuditorUsername = username
 		c.AuditorPassword = string(hashed)
 		// Mengganti kredensial membatalkan semua sesi aktif (epoch naik).
 		c.SessionEpoch++
 	})
 
 	if err := h.cfg.Persist(); err != nil {
+		h.cfg.Update(func(c *config.Config) {
+			c.AuditorUsername = old.AuditorUsername
+			c.AuditorPassword = old.AuditorPassword
+			c.SessionEpoch = old.SessionEpoch
+		})
 		http.Error(w, `{"error":"failed to save config"}`, http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[Auth] Auditor account created/rotated for user %q; all sessions invalidated (epoch bump)", req.Username)
+	log.Printf("[Auth] Auditor account created/rotated for user %q; all sessions invalidated (epoch bump)", username)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
@@ -250,8 +302,12 @@ func (h *AuthHandler) SetupPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Password == "" || len(req.Password) < 8 {
-		http.Error(w, `{"error":"password must be at least 8 characters"}`, http.StatusBadRequest)
+	// Username wajib: username kosong akan menyimpan password tetapi
+	// tidak ada username yang bisa login (setup terkunci 403 selamanya).
+	// Batas 72 byte karena bcrypt menolak password yang lebih panjang.
+	username := strings.TrimSpace(req.Username)
+	if username == "" || len(req.Password) < 8 || len(req.Password) > 72 {
+		http.Error(w, `{"error":"username required and password must be 8-72 characters"}`, http.StatusBadRequest)
 		return
 	}
 
@@ -261,16 +317,23 @@ func (h *AuthHandler) SetupPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Simpan nilai lama agar gagal persist bisa di-rollback (lihat
+	// SetupAuditor): tanpa ini, memori dan disk berbeda dan setup
+	// berikutnya kena 403 "password already configured".
+	old := h.cfg.Snapshot()
 	h.cfg.Update(func(c *config.Config) {
-		if req.Username != "" {
-			c.AdminUsername = req.Username
-		}
+		c.AdminUsername = username
 		c.AdminPassword = string(hashedPassword)
 		// Mengganti kredensial membatalkan semua sesi aktif (epoch naik).
 		c.SessionEpoch++
 	})
 
 	if err := h.cfg.Persist(); err != nil {
+		h.cfg.Update(func(c *config.Config) {
+			c.AdminUsername = old.AdminUsername
+			c.AdminPassword = old.AdminPassword
+			c.SessionEpoch = old.SessionEpoch
+		})
 		http.Error(w, `{"error":"failed to save config"}`, http.StatusInternalServerError)
 		return
 	}

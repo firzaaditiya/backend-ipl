@@ -1,9 +1,15 @@
 package backup
 
 import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -152,5 +158,77 @@ func TestStopWaitsForInFlightRun(t *testing.T) {
 	case <-stopped:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Stop did not return after backup completed")
+	}
+}
+
+func TestPostWebhookSignsWithHMAC(t *testing.T) {
+	var gotSig, gotTS string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSig = r.Header.Get("X-FIM-IPL-Signature")
+		gotTS = r.Header.Get("X-FIM-IPL-Timestamp")
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	m := NewManager(newTestLedger(t), nil, "", time.Hour)
+	m.allowLocalWebhook = true
+	m.SetWebhookSecret("test-secret")
+	payload := []byte(`{"blocks":1}`)
+
+	if err := m.postWebhook(srv.URL+"/hook", "test.json", payload); err != nil {
+		t.Fatalf("postWebhook: %v", err)
+	}
+	if gotSig == "" || gotTS == "" {
+		t.Fatalf("expected signature headers, got sig=%q ts=%q", gotSig, gotTS)
+	}
+	ts, err := strconv.ParseInt(gotTS, 10, 64)
+	if err != nil || time.Now().Unix()-ts > 60 || ts > time.Now().Unix()+5 {
+		t.Fatalf("timestamp must be current unix time, got %q", gotTS)
+	}
+	mac := hmac.New(sha256.New, []byte("test-secret"))
+	mac.Write([]byte(gotTS + "."))
+	mac.Write(payload)
+	want := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	if gotSig != want {
+		t.Fatalf("signature mismatch: got %q want %q", gotSig, want)
+	}
+	if string(gotBody) != string(payload) {
+		t.Fatalf("body changed by signing: got %q", gotBody)
+	}
+}
+
+func TestPostWebhookNoSignatureWithoutSecret(t *testing.T) {
+	var gotSig, gotTS string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSig = r.Header.Get("X-FIM-IPL-Signature")
+		gotTS = r.Header.Get("X-FIM-IPL-Timestamp")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	m := NewManager(newTestLedger(t), nil, "", time.Hour)
+	m.allowLocalWebhook = true
+	// Tanpa SetWebhookSecret: tidak ada header tanda tangan.
+	if err := m.postWebhook(srv.URL+"/hook", "test.json", []byte(`{}`)); err != nil {
+		t.Fatalf("postWebhook: %v", err)
+	}
+	if gotSig != "" || gotTS != "" {
+		t.Fatalf("expected no signature headers without secret, got sig=%q ts=%q", gotSig, gotTS)
+	}
+}
+
+func TestGuardedDialRefusesLocalhostName(t *testing.T) {
+	// "localhost" resolve ke 127.0.0.1 — dial guard harus menolaknya walau
+	// host-nya berupa nama, bukan IP literal.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := guardedDialContext(ctx, "tcp", "localhost:9"); err == nil {
+		t.Fatal("expected dial to localhost to be refused")
+	}
+	if _, err := guardedDialContext(ctx, "tcp", "127.0.0.1:9"); err == nil {
+		t.Fatal("expected dial to 127.0.0.1 to be refused")
 	}
 }

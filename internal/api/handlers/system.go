@@ -17,7 +17,16 @@ import (
 // 1.2.0 = karantina dan pelepasan diverifikasi ulang dengan membaca kembali
 // izin berkas (bukan hanya dari galat chmod), dan dasbor menampilkan hitung
 // mundur pemindaian berikutnya agar polling deterministik dapat diamati.
-const AppVersion = "1.4.0"
+// 1.3.0 = daftar berkas terkarantina (endpoint + panel dasbor) dan
+// pelepasan per-berkas dengan mode asli yang dipulihkan.
+// 1.4.0 = pengerasan keamanan (netguard SSRF, trust-proxy, limiter login,
+// fail-closed CORS/CSRF, session_epoch, mode asli saat release) dan
+// teks UI yang diluruskan.
+// 1.5.0 = deteksi perubahan izin (MODE_CHANGED), karantina/release lewat
+// handle O_PATH|O_NOFOLLOW, HMAC webhook, dial webhook ke IP literal,
+// alert Telegram async, logout mencabut token (denylist jti), HSTS lewat
+// proxy tepercaya, dan validasi setup yang diperketat.
+const AppVersion = "1.5.0"
 
 // SystemHandler menyajikan informasi runtime yang aman untuk ditampilkan di UI.
 // Tidak ada secret, path data, atau kredensial yang dikembalikan.

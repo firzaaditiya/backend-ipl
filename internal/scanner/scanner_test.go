@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/skripsi/fim-ipl/internal/models"
@@ -120,5 +121,77 @@ func TestScanReportsOversizeNonCodeFileAsSkipped(t *testing.T) {
 	}
 	if smallResult == nil || smallResult.Err != nil {
 		t.Fatalf("small file should be scanned normally, got %+v", smallResult)
+	}
+}
+
+func TestScanRecordsFileMode(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "a.php")
+	if err := os.WriteFile(path, []byte("<?php // test"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	sc := New(2, []string{root})
+	results, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan() error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %+v", results)
+	}
+	if results[0].Mode != 0o640 {
+		t.Fatalf("expected mode 0640, got %04o", results[0].Mode)
+	}
+	if results[0].Hash == "" {
+		t.Fatal("expected a hash for a readable file")
+	}
+}
+
+func TestHashFileRejectsSymlink(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("O_NOFOLLOW hanya berlaku di Linux")
+	}
+	// Catatan: pengujian ini berjalan di Linux (VPS/produksi). Di Windows,
+	// HashFile memakai open biasa dan penolakan symlink ditangani Lstat
+	// di worker/collectFiles.
+	root := t.TempDir()
+	outside := t.TempDir()
+	target := filepath.Join(outside, "real.txt")
+	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink tidak tersedia di lingkungan ini: %v", err)
+	}
+	if _, err := HashFile(link); err == nil {
+		t.Fatal("HashFile harus menolak symlink (O_NOFOLLOW)")
+	}
+	// File biasa tetap bisa di-hash.
+	if _, err := HashFile(target); err != nil {
+		t.Fatalf("HashFile file biasa gagal: %v", err)
+	}
+}
+
+func TestCollectFilesSymlinkDirNotFollowed(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "hidden.php"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(root, "uploads")
+	if err := os.Symlink(outside, linkDir); err != nil {
+		t.Skipf("symlink tidak tersedia di lingkungan ini: %v", err)
+	}
+
+	sc := New(2, []string{root})
+	results, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan() error: %v", err)
+	}
+	for _, res := range results {
+		if res.Path == filepath.Join(outside, "hidden.php") {
+			t.Fatal("isi direktori symlink tidak boleh dipindai")
+		}
 	}
 }

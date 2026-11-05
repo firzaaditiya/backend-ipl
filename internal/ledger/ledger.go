@@ -24,6 +24,11 @@ var (
 	bucketMeta            = []byte("meta")
 	bucketMetrics         = []byte("metrics")
 	bucketQuarantineModes = []byte("quarantine_modes")
+	// bucketRevokedTokens menyimpan jti token yang dicabut lewat logout
+	// (nilai = unix expiry token). Bukan bagian hash-chain: ini status
+	// sesi, bukan jejak audit. Entri kedaluwarsa dibersihkan saat ada
+	// pencabutan baru (lihat RevokeToken).
+	bucketRevokedTokens = []byte("revoked_tokens")
 )
 
 const genesisPrevHash = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -62,7 +67,7 @@ func New(dbPath string) (*Ledger, error) {
 	}
 
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketBlocks, bucketBaseline, bucketMeta, bucketMetrics, bucketQuarantineModes} {
+		for _, b := range [][]byte{bucketBlocks, bucketBaseline, bucketMeta, bucketMetrics, bucketQuarantineModes, bucketRevokedTokens} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -160,6 +165,47 @@ func (l *Ledger) UpdateBaselineEntry(record models.FileRecord) error {
 	})
 }
 
+// AdoptBaselineModes menulis mode yang teramati ke entri baseline yang
+// belum mencatat mode (Mode == 0, dari sebelum v1.5.0), dalam satu
+// transaksi. Hanya entri dengan Mode 0 yang disentuh; entri yang sudah
+// punya mode tidak pernah ditimpa diam-diam oleh fungsi ini.
+func (l *Ledger) AdoptBaselineModes(modes map[string]uint32) error {
+	if len(modes) == 0 {
+		return nil
+	}
+	return l.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketBaseline)
+		if b == nil {
+			return nil
+		}
+		for path, mode := range modes {
+			if mode == 0 {
+				continue
+			}
+			v := b.Get([]byte(path))
+			if v == nil {
+				continue
+			}
+			var record models.FileRecord
+			if err := json.Unmarshal(v, &record); err != nil {
+				return err
+			}
+			if record.Mode != 0 {
+				continue
+			}
+			record.Mode = mode
+			data, err := json.Marshal(record)
+			if err != nil {
+				return err
+			}
+			if err := b.Put([]byte(path), data); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // RemoveBaselineEntry menghapus file dari baseline (untuk kasus DELETED)
 func (l *Ledger) RemoveBaselineEntry(path string) error {
 	return l.db.Update(func(tx *bolt.Tx) error {
@@ -230,21 +276,65 @@ func (l *Ledger) DeleteQuarantineMode(path string) error {
 	})
 }
 
-// GetBaselineTime mengembalikan timestamp baseline terakhir (RFC3339) atau string kosong.
-func (l *Ledger) GetBaselineTime() (string, error) {
-	var t string
-	err := l.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketMeta)
+// ---------------------------------------------------------------------------
+// Revoked tokens (logout)
+// ---------------------------------------------------------------------------
+//
+// Sejak v1.5.0, logout mencabut token itu saja (bukan semua sesi): jti
+// token ditulis ke bucket ini dan ParseClaims menolaknya sampai token
+// kedaluwarsa. Token lama tanpa jti (sebelum v1.5.0) tidak bisa dicabut
+// satu-per-satu; ia tetap valid sampai kedaluwarsa 24 jam atau sampai
+// kredensial diubah (epoch naik).
+
+// RevokeToken mencatat jti sebagai dicabut sampai expiresAt. Entri yang
+// sudah kedaluwarsa dibersihkan dalam transaksi yang sama agar bucket
+// tidak tumbuh tanpa batas.
+func (l *Ledger) RevokeToken(jti string, expiresAt time.Time) error {
+	if jti == "" {
+		return nil
+	}
+	now := time.Now().Unix()
+	return l.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketRevokedTokens)
 		if b == nil {
 			return nil
 		}
-		v := b.Get([]byte("baseline_time"))
-		if v != nil {
-			t = string(v)
+		// Bersihkan entri kedaluwarsa (peluang murah: satu iterasi per logout).
+		_ = b.ForEach(func(k, v []byte) error {
+			if len(v) == 8 && int64(binary.BigEndian.Uint64(v)) <= now {
+				return b.Delete(k)
+			}
+			return nil
+		})
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(expiresAt.Unix()))
+		return b.Put([]byte(jti), buf[:])
+	})
+}
+
+// IsTokenRevoked melaporkan apakah jti pernah dicabut dan tokennya belum
+// kedaluwarsa. Entri kedaluwarsa dianggap tidak dicabut (tokennya sudah
+// mati sendiri) dan dibiarkan untuk dibersihkan RevokeToken berikutnya.
+func (l *Ledger) IsTokenRevoked(jti string) bool {
+	if jti == "" {
+		return false
+	}
+	revoked := false
+	_ = l.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketRevokedTokens)
+		if b == nil {
+			return nil
+		}
+		v := b.Get([]byte(jti))
+		if v == nil || len(v) != 8 {
+			return nil
+		}
+		if int64(binary.BigEndian.Uint64(v)) > time.Now().Unix() {
+			revoked = true
 		}
 		return nil
 	})
-	return t, err
+	return revoked
 }
 
 // ---------------------------------------------------------------------------
@@ -268,12 +358,17 @@ func (l *Ledger) AppendBlock(event models.AnomalyEvent) (*models.Block, error) {
 		}
 
 		block = models.Block{
-			ID:            fmt.Sprintf("BLK-%06d", seq),
-			Timestamp:     time.Now(),
-			FilePath:      event.FilePath,
-			Action:        event.Action,
-			OldHash:       event.OldHash,
-			NewHash:       event.NewHash,
+			ID:        fmt.Sprintf("BLK-%06d", seq),
+			Timestamp: time.Now(),
+			FilePath:  event.FilePath,
+			Action:    event.Action,
+			OldHash:   event.OldHash,
+			NewHash:   event.NewHash,
+			// OldMode/NewMode hanya metadata tampilan: TIDAK ikut dihitung
+			// ke dalam block hash (seperti QuarantineErr), agar blok lama
+			// tetap terverifikasi.
+			OldMode:       event.OldMode,
+			NewMode:       event.NewMode,
 			Quarantined:   event.Quarantined,
 			QuarantineErr: event.QuarantineErr,
 			PrevBlockHash: prevHash,
@@ -391,30 +486,6 @@ func (l *Ledger) GetBlockCount() (int, error) {
 	return count, err
 }
 
-// GetAnomalyCount menghitung temuan pemindaian saja (CREATED/MODIFIED/DELETED).
-// Block RELEASED adalah catatan tindakan admin, bukan anomali file, sehingga
-// tidak boleh menggelembungkan angka "total anomali" di dashboard.
-func (l *Ledger) GetAnomalyCount() (int, error) {
-	count := 0
-	err := l.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketBlocks)
-		if b == nil {
-			return nil
-		}
-		return b.ForEach(func(_, v []byte) error {
-			var block models.Block
-			if err := json.Unmarshal(v, &block); err != nil {
-				return nil
-			}
-			if block.Action != models.ActionReleased {
-				count++
-			}
-			return nil
-		})
-	})
-	return count, err
-}
-
 // QuarantinedFile adalah satu berkas yang status TERAKHIR-nya masih
 // dikarantina, beserta izin aslinya bila tercatat (nil bila berkas
 // dikarantina sebelum pencatatan izin ada, sejak v1.1.0).
@@ -524,6 +595,16 @@ type DashboardCounts struct {
 
 // GetDashboardCounts menghitung baseline, total blok, anomali, dan file yang
 // masih dikarantina dalam satu transaksi.
+//
+// Definisi resmi angka dashboard (satu-satunya yang dipakai naskah):
+//   - Anomalies = seluruh blok kecuali RELEASED (termasuk UNREADABLE dan
+//     MODE_CHANGED), kumulatif sejak awal ledger.
+//   - TotalBlocks = seluruh blok, termasuk RELEASED.
+//   - TotalFiles = jumlah entri baseline; safe = TotalFiles - Quarantined.
+//   - QuarantinedFiles = file yang status TERAKHIR-nya masih dikarantina.
+//
+// Metode GetAnomalyCount yang lama dihapus di v1.5.0 karena menduplikasi
+// definisi ini dengan nama yang sama.
 func (l *Ledger) GetDashboardCounts() (DashboardCounts, error) {
 	var counts DashboardCounts
 

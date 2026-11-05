@@ -75,13 +75,24 @@ func main() {
 	hub := realtime.NewHub()
 	log.Println("[FIM-IPL] Realtime hub initialized")
 
+	// Antrean alert Telegram (sejak v1.5.0): pengiriman berjalan di
+	// goroutine terpisah agar API Telegram yang lambat/mati tidak pernah
+	// menahan pipeline scan.
+	alertJobs := make(chan alertJob, 64)
+	alertStop := make(chan struct{})
+	startAlertWorker(tg, alertJobs, alertStop)
+
 	sc.RegisterScanCycle(func() {
-		runFullScanCycle(sc, db, tg, bm, hub)
+		runFullScanCycle(sc, db, bm, hub, alertJobs)
 	})
 
 	router := api.NewRouter(cfg, db, sc, tg, bm, hub)
 
 	snap := cfg.Snapshot()
+
+	// Secret HMAC webhook (env-only, FIM_WEBHOOK_SECRET). Kosong berarti
+	// webhook dikirim tanpa tanda tangan.
+	bm.SetWebhookSecret(snap.WebhookSecret)
 
 	// Auto-resume monitoring (sejak v1.1.0): status monitoring dipertahankan
 	// di config.json oleh handler Start/Stop, jadi restart proses (mis.
@@ -121,6 +132,7 @@ func main() {
 		sc.StopMonitoring()
 		bm.Stop()
 		hub.Close()
+		close(alertStop)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -166,10 +178,75 @@ func clearUnresolved(path string) {
 	unresolvedMu.Unlock()
 }
 
+// alertJob adalah satu pekerjaan pengiriman Telegram. Seluruh alert
+// Telegram berjalan lewat antrean ini (sejak v1.5.0) agar API Telegram yang
+// lambat/mati tidak pernah menahan pipeline scan: pengiriman sinkron (retry
+// sampai ~48 detik per pesan, sampai ~190 detik per siklus) bisa melewati
+// interval 120 detik dan membuat siklus berikut di-skip sebagai overlap —
+// tepat saat ketepatan deteksi paling dibutuhkan.
+type alertJob struct {
+	kind     string // "system" | "failures" | "blocks"
+	title    string
+	message  string
+	failures []notifier.QuarantineFailure
+	blocks   []*models.Block
+	recorded int
+}
+
+func startAlertWorker(tg *notifier.Telegram, jobs <-chan alertJob, stop <-chan struct{}) {
+	go func() {
+		for {
+			select {
+			case job := <-jobs:
+				if tg == nil || !tg.IsConfigured() {
+					continue
+				}
+				switch job.kind {
+				case "system":
+					if err := tg.SendSystemAlert(job.title, job.message); err != nil {
+						log.Printf("[Telegram] System alert failed: %v", err)
+					}
+				case "failures":
+					if err := tg.SendQuarantineFailures(job.failures); err != nil {
+						log.Printf("[Telegram] Quarantine-failure alert failed: %v", err)
+					}
+				case "blocks":
+					if len(job.blocks) <= 3 {
+						for _, block := range job.blocks {
+							if err := tg.SendAlert(block); err != nil {
+								log.Printf("[Telegram] Alert failed: %v", err)
+							}
+						}
+					} else if err := tg.SendBatchAlert(job.blocks, job.recorded); err != nil {
+						log.Printf("[Telegram] Batch alert failed: %v", err)
+					}
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+}
+
+// enqueueAlert mengirim pekerjaan ke antrean tanpa pernah memblokir
+// pipeline scan. Bila antrean penuh (64 pekerjaan tertunda — jauh di atas
+// volume normal ~5 per siklus), pekerjaan dibuang dan dicatat di log.
+// jobs boleh nil (pengujian tanpa worker): pekerjaan dibuang diam-diam.
+func enqueueAlert(jobs chan<- alertJob, job alertJob) {
+	if jobs == nil {
+		return
+	}
+	select {
+	case jobs <- job:
+	default:
+		log.Printf("[Telegram] Alert queue full, dropping %s alert", job.kind)
+	}
+}
+
 // notifyScanFailure mengirim satu peringatan per jenis error. Pengulangan
 // setiap siklus tidak dikirim ulang agar kanal tidak banjir, tetapi tetap
 // dicatat di log oleh caller.
-func notifyScanFailure(tg *notifier.Telegram, err error) {
+func notifyScanFailure(jobs chan<- alertJob, err error) {
 	message := err.Error()
 
 	scanAlertMu.Lock()
@@ -180,11 +257,7 @@ func notifyScanFailure(tg *notifier.Telegram, err error) {
 	lastScanErr = message
 	scanAlertMu.Unlock()
 
-	if tg != nil && tg.IsConfigured() {
-		if sendErr := tg.SendSystemAlert("PEMINDAIAN GAGAL", message); sendErr != nil {
-			log.Printf("[Telegram] Scan-failure alert failed: %v", sendErr)
-		}
-	}
+	enqueueAlert(jobs, alertJob{kind: "system", title: "PEMINDAIAN GAGAL", message: message})
 }
 
 func clearScanFailure() {
@@ -195,13 +268,14 @@ func clearScanFailure() {
 
 // baselineUpdateAllowed memastikan file berbahaya tidak pernah dianggap
 // "normal" saat karantina gagal. DELETED selalu boleh dihapus dari baseline;
-// CREATED/MODIFIED hanya boleh setelah chmod berhasil; UNREADABLE tidak pernah
-// boleh karena isi terbaru tidak pernah berhasil dibaca.
+// CREATED/MODIFIED/MODE_CHANGED hanya boleh setelah chmod berhasil;
+// UNREADABLE tidak pernah boleh karena isi terbaru tidak pernah berhasil
+// dibaca.
 func baselineUpdateAllowed(action string, qres quarantine.Result) bool {
 	switch action {
 	case models.ActionDeleted:
 		return true
-	case models.ActionCreated, models.ActionModified:
+	case models.ActionCreated, models.ActionModified, models.ActionModeChanged:
 		return qres.Success
 	default:
 		return false
@@ -262,8 +336,8 @@ func isQuarantineEffective(info os.FileInfo) bool {
 
 // runFullScanCycle adalah pipeline eksekusi satu siklus scan:
 //
-//	metrics.Start()  →  scanner.Scan()  →  compare  →  quarantine  →  ledger.AppendBlock  →  metrics.Finish → saveMetric  →  telegram alert  →  optional backup
-func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, tg *notifier.Telegram, bm *backup.Manager, hub *realtime.Hub) {
+//	metrics.Start()  →  scanner.Scan()  →  compare  →  quarantine  →  ledger.AppendBlock  →  metrics.Finish → saveMetric  →  broadcast SSE  →  telegram alert (async, via antrean)  →  optional backup
+func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, bm *backup.Manager, hub *realtime.Hub, alertJobs chan<- alertJob) {
 	// Satu panic di pipeline tidak boleh mematikan daemon. FinishScan (defer
 	// yang didaftarkan di bawah) tetap dijalankan lebih dulu karena urutan LIFO.
 	defer func() {
@@ -286,6 +360,7 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, tg *notifier.Teleg
 		cycle.MarkSkipped("maintenance_mode")
 		m := cycle.Finish(0, 0, 0)
 		_ = db.SaveMetric(m)
+		broadcastScan(hub, m)
 		log.Println("[Scan] Skipped: maintenance mode active")
 		return
 	}
@@ -295,6 +370,7 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, tg *notifier.Teleg
 		cycle.MarkSkipped("overlap")
 		m := cycle.Finish(0, 0, 0)
 		_ = db.SaveMetric(m)
+		broadcastScan(hub, m)
 		log.Println("[Scan] Skipped: previous scan cycle still running")
 		return
 	}
@@ -306,9 +382,10 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, tg *notifier.Teleg
 	results, err := sc.Scan()
 	if err != nil {
 		log.Printf("[Scan] Error during scan: %v", err)
-		notifyScanFailure(tg, err)
+		notifyScanFailure(alertJobs, err)
 		m := cycle.Finish(0, 0, 0)
 		_ = db.SaveMetric(m)
+		broadcastScan(hub, m)
 		return
 	}
 	clearScanFailure()
@@ -327,6 +404,7 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, tg *notifier.Teleg
 		log.Printf("[Scan] Error getting baseline: %v", err)
 		m := cycle.Finish(len(results), 0, 0)
 		_ = db.SaveMetric(m)
+		broadcastScan(hub, m)
 		return
 	}
 
@@ -334,6 +412,7 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, tg *notifier.Teleg
 		log.Println("[Scan] No baseline found. Please initialize baseline first.")
 		m := cycle.Finish(len(results), 0, 0)
 		_ = db.SaveMetric(m)
+		broadcastScan(hub, m)
 		return
 	}
 
@@ -350,9 +429,25 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, tg *notifier.Teleg
 	compareResult := scanner.CompareWithBaseline(results, baseline, sc.WorkerCount())
 	totalAnomalies := compareResult.TotalAnomalies()
 
+	// Adopsi mode baseline lama (Mode == 0, dari sebelum v1.5.0): satu
+	// transaksi, tanpa event — agar perubahan izin pada siklus berikutnya
+	// benar-benar terdeteksi dan 3901 file lama tidak sekaligus
+	// dilaporkan berubah pada siklus pertama setelah upgrade.
+	if len(compareResult.ModeAdoptions) > 0 {
+		if err := db.AdoptBaselineModes(compareResult.ModeAdoptions); err != nil {
+			log.Printf("[Scan] Failed to adopt baseline modes: %v", err)
+		} else {
+			log.Printf("[Scan] Adopted modes for %d baseline file(s) (pre-v1.5.0 records)", len(compareResult.ModeAdoptions))
+		}
+	}
+	if compareResult.SkippedOversize > 0 {
+		log.Printf("[Scan] %d file(s) skipped (oversize >50 MB, non-kode): isi tidak diperiksa", compareResult.SkippedOversize)
+	}
+
 	if totalAnomalies == 0 {
 		log.Println("[Scan] Scan complete. No anomalies detected.")
 		m := cycle.Finish(len(results), 0, 0)
+		m.SkippedOversize = compareResult.SkippedOversize
 		_ = db.SaveMetric(m)
 		broadcastScan(hub, m)
 		return
@@ -374,7 +469,8 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, tg *notifier.Teleg
 	var quarantineFailures []notifier.QuarantineFailure
 
 	for _, event := range compareResult.AllEvents() {
-		// Karantina untuk CREATED/MODIFIED/UNREADABLE. DELETED tidak punya file.
+		// Karantina untuk CREATED/MODIFIED/MODE_CHANGED/UNREADABLE.
+		// DELETED tidak punya file.
 		attemptQuarantine := event.Action != models.ActionDeleted
 		var qres quarantine.Result
 
@@ -457,7 +553,11 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, tg *notifier.Teleg
 			if err := db.RemoveBaselineEntry(event.FilePath); err != nil {
 				log.Printf("[Scan] Failed to remove baseline entry: %v", err)
 			}
-		case models.ActionModified, models.ActionCreated:
+			// Catatan mode karantina sudah tidak relevan: file-nya hilang.
+			if err := db.DeleteQuarantineMode(event.FilePath); err != nil {
+				log.Printf("[Scan] Failed to clear quarantine mode record: %v", err)
+			}
+		case models.ActionModified, models.ActionCreated, models.ActionModeChanged:
 			if !baselineUpdateAllowed(event.Action, qres) {
 				log.Printf("[Scan] Baseline retained for %s (quarantine not successful)", event.FilePath)
 				break
@@ -466,6 +566,7 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, tg *notifier.Teleg
 				record := models.FileRecord{
 					Path:      sr.Path,
 					Hash:      sr.Hash,
+					Mode:      sr.Mode,
 					Size:      sr.Size,
 					ModTime:   sr.ModTime,
 					ScannedAt: time.Now(),
@@ -483,31 +584,21 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, tg *notifier.Teleg
 	// dihitung ulang agar grafik tidak naik tanpa ada temuan baru.
 	recorded := len(blocks)
 	m := cycle.Finish(len(results), recorded, quarantinedCount)
+	m.SkippedOversize = compareResult.SkippedOversize
 	if err := db.SaveMetric(m); err != nil {
 		log.Printf("[Metrics] Failed to save: %v", err)
 	}
-	log.Printf("[Metrics] cycle: elapsed=%dms mem_alloc=%.2fMB files=%d anomalies=%d quarantined=%d",
-		m.ElapsedMs, float64(m.MemAllocBytes)/1024.0/1024.0, m.FilesScanned, m.Anomalies, m.Quarantined)
+	log.Printf("[Metrics] cycle: elapsed=%dms mem_alloc=%.2fMB files=%d anomalies=%d quarantined=%d skipped_oversize=%d",
+		m.ElapsedMs, float64(m.MemAllocBytes)/1024.0/1024.0, m.FilesScanned, m.Anomalies, m.Quarantined, m.SkippedOversize)
 	broadcastScan(hub, m)
 
-	// 6) Telegram alerts
-	if len(quarantineFailures) > 0 && tg.IsConfigured() {
-		if err := tg.SendQuarantineFailures(quarantineFailures); err != nil {
-			log.Printf("[Telegram] Quarantine-failure alert failed: %v", err)
-		}
+	// 6) Telegram alerts — async lewat antrean (lihat startAlertWorker):
+	// pipeline scan tidak pernah menunggu jaringan.
+	if len(quarantineFailures) > 0 {
+		enqueueAlert(alertJobs, alertJob{kind: "failures", failures: quarantineFailures})
 	}
-	if len(blocks) > 0 && tg.IsConfigured() {
-		if len(blocks) <= 3 {
-			for _, block := range blocks {
-				if err := tg.SendAlert(block); err != nil {
-					log.Printf("[Scan] Telegram alert failed: %v", err)
-				}
-			}
-		} else {
-			if err := tg.SendBatchAlert(blocks, recorded); err != nil {
-				log.Printf("[Scan] Telegram batch alert failed: %v", err)
-			}
-		}
+	if len(blocks) > 0 {
+		enqueueAlert(alertJobs, alertJob{kind: "blocks", blocks: blocks, recorded: recorded})
 	}
 
 	// 7) Trigger backup jika temuan BARU di siklus ini dianggap kritis.

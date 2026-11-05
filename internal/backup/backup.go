@@ -12,12 +12,16 @@ package backup
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +50,12 @@ type Manager struct {
 	// dipakai. Tidak ada jalur konfigurasi/env yang mengaktifkannya, jadi
 	// produksi selalu memvalidasi target webhook sebagai alamat publik.
 	allowLocalWebhook bool
+
+	// webhookSecret menandatangani export webhook (HMAC-SHA256). Diisi
+	// dari environment (FIM_WEBHOOK_SECRET) lewat SetWebhookSecret;
+	// TIDAK PERNAH ditulis ke config.json dan tidak bisa diubah lewat
+	// Settings API. Kosong = webhook dikirim tanpa tanda tangan.
+	webhookSecret string
 
 	// runMu menyerialkan seluruh eksekusi backup. Tanpa ini, backup manual,
 	// backup terjadwal, dan backup anomali kritis dapat berjalan bersamaan dan
@@ -90,27 +100,53 @@ func newWebhookClient() *http.Client {
 }
 
 func guardedDialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	host, _, err := net.SplitHostPort(address)
+	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, err
 	}
+
+	// Resolve SEKALI, lalu dial alamat IP literal hasil validasi — bukan
+	// hostname-nya lagi. Resolve kedua di dalam DialContext membuka jendela
+	// DNS-rebinding: jawaban validasi (IP publik) dan jawaban dial (IP
+	// internal) bisa berbeda bila penyerang mengendalikan DNS target.
+	// Untuk HTTPS, SNI/verifikasi sertifikat tetap memakai hostname dari
+	// URL (http.Transport yang mengatur TLS), jadi dial ke IP literal
+	// tidak melemahkan TLS.
+	var ips []net.IP
 	if ip := net.ParseIP(host); ip != nil {
-		if netguard.IsInternalIP(ip) {
-			return nil, fmt.Errorf("webhook dial to non-public address %q refused", host)
-		}
+		ips = []net.IP{ip}
 	} else {
-		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+		resolved, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 		if err != nil {
 			return nil, err
 		}
-		for _, ip := range ips {
-			if netguard.IsInternalIP(ip) {
-				return nil, fmt.Errorf("webhook host %q resolves to non-public address", host)
-			}
+		ips = resolved
+	}
+	for _, ip := range ips {
+		if netguard.IsInternalIP(ip) {
+			return nil, fmt.Errorf("webhook host %q resolves to non-public address", host)
 		}
 	}
+
 	var d net.Dialer
-	return d.DialContext(ctx, network, address)
+	var lastErr error
+	for _, ip := range ips {
+		conn, err := d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// SetWebhookSecret mengisi secret HMAC untuk menandatangani export webhook.
+// Dipanggil sekali saat startup dari environment (FIM_WEBHOOK_SECRET);
+// tidak ada jalur runtime yang mengubahnya.
+func (m *Manager) SetWebhookSecret(secret string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.webhookSecret = secret
 }
 
 // Start menjalankan scheduler backup di goroutine terpisah. Aman dipanggil
@@ -285,6 +321,22 @@ func (m *Manager) postWebhook(url, filename string, payload []byte) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-FIM-IPL-File", filename)
+	// Tanda tangani export agar penerima bisa membedakan export asli dari
+	// POST palsu: HMAC-SHA256(secret, timestamp + "." + body). Penerima
+	// menghitung ulang HMAC yang sama, membandingkan constant-time, dan
+	// menolak timestamp lebih tua dari 5 menit (anti-replay). Tanpa secret
+	// yang dikonfigurasi, header tidak dikirim (perilaku lama).
+	m.mu.RLock()
+	secret := m.webhookSecret
+	m.mu.RUnlock()
+	if secret != "" {
+		ts := strconv.FormatInt(time.Now().Unix(), 10)
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write([]byte(ts + "."))
+		mac.Write(payload)
+		req.Header.Set("X-FIM-IPL-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+		req.Header.Set("X-FIM-IPL-Timestamp", ts)
+	}
 
 	resp, err := m.webhookClient().Do(req)
 	if err != nil {

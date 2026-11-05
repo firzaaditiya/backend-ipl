@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -171,10 +170,6 @@ func validateWebhookURL(raw string) error {
 	return netguard.ValidatePublicURL(raw)
 }
 
-func isInternalIP(ip net.IP) bool {
-	return netguard.IsInternalIP(ip)
-}
-
 // validateOrigins memastikan setiap entry berupa origin (scheme + host[:port])
 // tanpa path, mis. "http://localhost:3000".
 func validateOrigins(origins []string) ([]string, error) {
@@ -185,7 +180,7 @@ func validateOrigins(origins []string) ([]string, error) {
 			continue
 		}
 		if value == "*" {
-			return nil, errors.New("use an empty list to allow all origins, not '*'")
+			return nil, errors.New("use '*' is not allowed; an empty list means no cross-origin access (fail-closed)")
 		}
 		parsed, err := url.Parse(value)
 		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {

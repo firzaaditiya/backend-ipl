@@ -55,7 +55,12 @@ func (h *SettingsHandler) GetSettings(w http.ResponseWriter, r *http.Request) {
 	// notifikasi (chat ID Telegram) dan URL webhook backup bukan kebutuhan
 	// Auditor, jadi disembunyikan dari respons role tersebut.
 	isAuditor := true
-	if claims, ok := middleware.ParseClaims(r, snap.JWTSecret, snap.SessionEpoch); ok {
+	if claims, ok := middleware.ParseClaimsWithRevocation(r, snap.JWTSecret, snap.SessionEpoch, func(jti string) bool {
+		if h.ledger == nil {
+			return false
+		}
+		return h.ledger.IsTokenRevoked(jti)
+	}); ok {
 		isAuditor = claims.Role == middleware.RoleAuditor
 	}
 	telegramChatID := snap.TelegramChatID
@@ -94,7 +99,7 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 		ScanIntervalSec  int      `json:"scan_interval_sec"`
 		WorkerCount      int      `json:"worker_count"`
 		TelegramToken    string   `json:"telegram_token"`
-		TelegramChatID   string   `json:"telegram_chat_id"`
+		TelegramChatID   *string  `json:"telegram_chat_id"`
 		BackupWebhookURL *string  `json:"backup_webhook_url"`
 		AllowedOrigins   []string `json:"allowed_origins"`
 	}
@@ -151,8 +156,12 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 		if req.TelegramToken != "" {
 			c.TelegramToken = req.TelegramToken
 		}
-		if req.TelegramChatID != "" {
-			c.TelegramChatID = req.TelegramChatID
+		// TelegramChatID: pointer nil = field tidak dikirim (biarkan nilai
+		// lama); string kosong eksplisit = hapus chat ID — sama seperti
+		// BackupWebhookURL di atas. Sebelum v1.5.0 field ini bertipe string
+		// biasa sehingga chat ID tidak pernah bisa dikosongkan dari UI.
+		if req.TelegramChatID != nil {
+			c.TelegramChatID = *req.TelegramChatID
 		}
 		// BackupWebhookURL: pointer nil = field tidak dikirim (biarkan nilai
 		// lama); string kosong eksplisit = hapus webhook. Sebelum v1.4.0,
@@ -160,7 +169,10 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 		if req.BackupWebhookURL != nil {
 			c.BackupWebhookURL = *req.BackupWebhookURL
 		}
-		// AllowedOrigins: array kosong eksplisit berarti "izinkan semua".
+		// AllowedOrigins: array kosong eksplisit berarti "tidak ada origin
+		// lintas situs yang diizinkan" (fail-closed, sejak v1.4.0) —
+		// bukan "izinkan semua". Komentar lama yang menulis sebaliknya
+		// sudah diperbaiki di v1.5.0.
 		if req.AllowedOrigins != nil {
 			c.AllowedOrigins = origins
 		}

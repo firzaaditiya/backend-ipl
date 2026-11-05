@@ -8,8 +8,13 @@ import (
 )
 
 // SecurityHeaders menambahkan header pertahanan dasar ke setiap respons API.
-// HSTS hanya dikirim saat koneksi memang TLS langsung (di belakang reverse
-// proxy, header ini biasanya ditambahkan oleh proxy tersebut).
+// HSTS dikirim bila koneksi memang TLS: langsung (r.TLS != nil) atau lewat
+// proxy tepercaya yang melaporkan X-Forwarded-Proto: https. Di produksi,
+// TLS diakhiri Cloudflare Tunnel lalu diteruskan ke Nginx lewat HTTP, jadi
+// r.TLS tidak pernah terisi; sinyalnya adalah header X-Forwarded-Proto
+// yang ditulis edge Cloudflare. Header itu hanya dipercaya bila
+// FIM_TRUST_PROXY=1 (tanpa itu, siapa pun bisa memalsukannya). Nginx tidak
+// menimpa header ini, jadi nilai edge diteruskan apa adanya ke backend.
 func SecurityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
@@ -20,7 +25,7 @@ func SecurityHeaders(next http.Handler) http.Handler {
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
 		h.Set("Cross-Origin-Resource-Policy", "same-origin")
 		h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
-		if r.TLS != nil {
+		if r.TLS != nil || (trustProxy && r.Header.Get("X-Forwarded-Proto") == "https") {
 			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}
 		next.ServeHTTP(w, r)
