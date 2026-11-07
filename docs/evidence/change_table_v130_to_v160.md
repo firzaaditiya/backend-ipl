@@ -1,8 +1,8 @@
 # Tabel Perubahan v1.3.0 → v1.6.0
 
 Perubahan sistem antara versi yang didokumentasikan di naskah v4
-(v1.3.0) dan versi beku v1.6.0 (dalam pengerjaan). Setiap baris memuat
-UJ yang membuktikannya. Penomoran KF baru untuk v1.6.0 belum ditetapkan
+(v1.3.0) dan versi beku v1.6.0 (dibekukan 7 Nov 2026, backend `3fe3ed6`,
+frontend `a57091a`). Setiap baris memuat UJ yang membuktikannya. Penomoran KF baru untuk v1.6.0 belum ditetapkan
 — itu keputusan penulis naskah (Firza); tabel ini memakai nomor UJ
 sebagai jangkar.
 
@@ -21,6 +21,8 @@ sebagai jangkar.
 | v1.6.0 (T-06) | 5 Nov 2026 | Jangkar di setiap alert Telegram; verifikasi terjadwal (1 menit setelah boot, lalu tiap jam) + `last_verified` di dasbor; verifier mandiri `cmd/verify` (fim-verify) | UJ-17 |
 | v1.6.0 (T-07) | 5 Nov 2026 | Secret Telegram dari `fim.env` (FIM_REQUIRE_EXTERNAL_SECRETS=1); hash bcrypt auditor diizinkan di `config.json`; bug Load (secret acak tertulis ke disk) diperbaiki; unit systemd repo disinkronkan | UJ-18 |
 | v1.6.0 (T-08) | 5 Nov 2026 | Batas sumber daya systemd: MemoryMax=256M, CPUWeight=10, Nice=10, IOSchedulingClass=idle + pengukuran | UJ-19 |
+| v1.6.0 (T-13) | 7 Nov 2026 | Format Telegram minimal: emoji hanya di judul, label tebal, nilai dalam `<code>`, hash blok lengkap sebagai jangkar, nilai dinamis di-escape; fallback teks polos bila HTTP 400 | UJ-20 |
+| v1.6.0 (beku) | 7 Nov 2026 | Pembekuan: backend `3fe3ed6`, frontend `a57091a`; `AppVersion` "1.6.0"; gates (gofmt/vet/test -race/govulncheck/lint/build/audit) lolos; seluruh UJ-01–UJ-20 diuji ulang pada satu binary beku (lihat `uj_matrix.csv`, run beku) | UJ-01–UJ-20 |
 
 ## Perubahan definisi dasbor
 

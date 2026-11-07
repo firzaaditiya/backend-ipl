@@ -9,9 +9,9 @@ masuk ke berkas bukti).
 | Berkas | Isi |
 |---|---|
 | `README.md` (ini) | Indeks paket, matriks KF → UJ, dan cara mereproduksi |
-| `uj_matrix.csv` | Matriks KF/NKF → UJ → bukti (satu baris per UJ, dengan versi + waktu + tiga sisi bukti: respons API, `stat` disk, blok ledger) |
-| `uj_latency.csv` | Hasil benchmark latensi deteksi (30 repetisi per tipe event, fase acak) |
-| `uj_resources.csv` | Hasil benchmark sumber daya (RSS, CPU, durasi siklus, latensi WordPress) |
+| `uj_matrix.csv` | Matriks KF/NKF → UJ → bukti (satu baris per UJ, dengan versi + waktu + tiga sisi bukti: respons API, `stat` disk, blok ledger). Baris UJ-01–UJ-19 memuat catatan "RUN BEKU v1.6.0" hasil uji ulang 7 Nov 2026; baris UJ-20 (format Telegram minimal) ditambahkan pada run beku. |
+| `uj_latency.csv` | Hasil benchmark latensi deteksi (30 repetisi per tipe event, fase acak). Kolom `run` membedakan run1 (ronde P0, 5 Nov 2026, binary dev) dan run2 (binary beku v1.6.0, 7 Nov 2026). |
+| `uj_resources.csv` | Hasil benchmark sumber daya (RSS, CPU, durasi siklus, latensi WordPress). Run4 = 3.901 berkas beku, run5 = ~20.000 berkas beku (7 Nov 2026). |
 | `uj_ledger_limits.md` | Hasil uji batas ledger (pemotongan ekor, perusakan OldMode, perusakan baseline, jangkar eksternal) |
 | `config_facts.md` | Fakta konfigurasi nyata (ter-redaksi): struktur `config.json` produksi, unit systemd, aturan port Nginx |
 | `change_table_v130_to_v160.md` | Tabel perubahan v1.3.0 → v1.6.0 (KF, UJ, definisi dasbor — terutama "Anomalies" — dan skema ledger) |
@@ -32,6 +32,7 @@ satu baris per UJ:
 - **UJ-17**: jangkar eksternal + verifikasi terjadwal + `fim-verify` (v1.6.0, T-06, instance uji).
 - **UJ-18**: manajemen secret produksi (v1.6.0, T-07, instance uji; langkah produksi menunggu persetujuan).
 - **UJ-19**: batas sumber daya systemd + pengukuran (v1.6.0, T-08, instance uji + baca produksi).
+- **UJ-20**: format Telegram minimal (v1.6.0, T-13, instance uji + unit test + render dari ledger nyata + pengiriman nyata).
 
 ## Cara mereproduksi
 
@@ -49,12 +50,44 @@ Skrip di `scripts/`:
 
 ## Status
 
-**BELUM BEKU.** Paket ini disiapkan sebelum pembekuan v1.6.0. Seluruh
-UJ harus dijalankan ulang pada SATU versi beku v1.6.0 setelah Firza
-menyetujuinya; angka-angka yang sudah ada (UJ-14–UJ-19 dari instance
-uji) adalah bukti ronde pengembangan, bukan bukti versi beku — dan
-akan dicatat ulang bila ada perubahan kode antara sekarang dan
-pembekuan.
+**BEKU v1.6.0.** Pembekuan 7 Nov 2026: backend `3fe3ed6f53150bb40182c1da95250637ba6c66e4`,
+frontend `a57091a81a315a8bbd2e77314f5d4dbcc08629c2`. Gates pada tree beku:
+gofmt bersih, `go vet` OK, `go test -race -count=1 ./...` semua paket OK,
+govulncheck 0 vulnerabilities, frontend tanpa perubahan (HEAD saja
+diverifikasi). Seluruh UJ-01–UJ-20 dijalankan ulang pada SATU binary beku
+yang sama (`/opt/fim-test-v16/fim-ipl-160`, dibangun 7 Nov 2026 19:09 WIB
+dari backend HEAD 3fe3ed6) di instance uji — hasilnya dicatat sebagai
+"RUN BEKU v1.6.0" di `uj_matrix.csv` dan sebagai run2/run4/run5 di CSV
+benchmark. Produksi TIDAK disentuh dan masih v1.5.0 (29 blok).
+
+Hasil run beku (7 Nov 2026):
+
+- Latensi deteksi (`uj_latency.csv` run2, 12:33–12:48 UTC, interval 30 dtk,
+  30 repetisi per tipe, 0 hilang): CREATED rata-rata 14,9 dtk (p95 26,9;
+  maks 28,8); MODIFIED rata-rata 17,0 (p95 27,4; maks 27,8); DELETED
+  rata-rata 18,4 (p95 26,8; maks 29,8); MODE_CHANGED rata-rata 15,5
+  (p95 27,4; maks 29,8). Teori: rata-rata T/2 = 15 dtk, maks T + durasi
+  siklus ~31 dtk — semua maks dalam teori; rata-rata dalam ~3,4 dtk dari
+  teori (DELETED 18,4 paling jauh — variasi sampling, dilaporkan apa
+  adanya).
+- Sumber daya run4 (3.901 berkas, `uj_resources.csv`): RSS 18,1–21,5 MB
+  (rata-rata 21,2), siklus 763–975 ms, HeapAlloc 5,67–8,13 MB, CPU maks
+  43% dari 1 vCPU (jendela 1 dtk), latensi WP lokal rata-rata 15 ms
+  (p95 26 ms), 16 ms selama siklus (n=4). Run5 (~20.000 berkas): RSS
+  31,8–58,6 MB (rata-rata 56,4), siklus 4.614–6.443 ms, HeapAlloc
+  24,74–32,37 MB, CPU maks 59%, latensi WP lokal rata-rata 18 ms
+  (p95 37 ms), 31 ms selama siklus (n=20). Baseline init 1,0 dtk
+  (3.901) / 5,8 dtk (20.000); deteksi CREATED pada 19.505 berkas ~13,3
+  dtk. MemoryMax=256M = ~12x RSS maks 3.901 berkas, ~4,4x RSS maks
+  20.000 berkas. Catatan metode: pengukuran CPU dan WP pada run beku
+  pertama memakai jendela sampling 10 ms dan URL publik via Cloudflare
+  (keduanya berisik, dibuang); angka di atas adalah pengukuran ulang
+  bersih (CPU jendela 1 dtk, WP lokal `http://127.0.0.1/` 301).
+- UJ-20 (T-13): format Telegram minimal terverifikasi lewat unit test,
+  render dari blok ledger nyata, DAN pengiriman nyata ke chat Firza
+  (test message 19:51:53 WIB + 1 alert anomali CREATED 19:56:53 WIB).
+- Keadaan akhir instance uji v16: 238 blok, head BLK-000238, rantai
+  valid, verify-baseline match (digest e6d1fc2c…, count 2), 0 karantina.
 
 Yang sudah terukur (pra-beku, instance uji):
 
