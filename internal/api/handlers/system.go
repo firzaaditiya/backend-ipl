@@ -26,7 +26,11 @@ import (
 // handle O_PATH|O_NOFOLLOW, HMAC webhook, dial webhook ke IP literal,
 // alert Telegram async, logout mencabut token (denylist jti), HSTS lewat
 // proxy tepercaya, dan validasi setup yang diperketat.
-const AppVersion = "1.5.0"
+// 1.6.0 = P0 T-01–T-08 (pelanggaran karantina, hash blok v2/v3, aksi admin
+// di ledger, digest baseline, exclude_globs, jangkar eksternal + verifikasi
+// terjadwal, secret dari environment, batas resource) dan pesan Telegram
+// HTML minimal (T-13).
+const AppVersion = "1.6.0"
 
 // SystemHandler menyajikan informasi runtime yang aman untuk ditampilkan di UI.
 // Tidak ada secret, path data, atau kredensial yang dikembalikan.

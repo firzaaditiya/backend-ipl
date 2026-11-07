@@ -1,6 +1,6 @@
 # FIM-IPL Backend
 
-**Versi: 1.5.0** (sumber versi tunggal: `AppVersion` di
+**Versi: 1.6.0** (sumber versi tunggal: `AppVersion` di
 `internal/api/handlers/system.go`; tampil di UI dan `/api/v1/healthz`).
 
 FIM-IPL Backend adalah daemon File Integrity Monitoring (FIM) dan REST API
@@ -582,6 +582,10 @@ match=true).
   tidak pernah menunda siklus scan berikutnya (sebelumnya pengiriman
   sinkron dapat membuat satu siklus melebihi interval 120 detik dan siklus
   berikutnya dilewati sebagai "overlap").
+- Sejak v1.6.0 pesan Telegram memakai format HTML minimal (judul tebal,
+  nilai dalam monospace, emoji hanya di judul); semua nilai dinamis
+  di-escape, dan bila Telegram menolak formatnya pesan dikirim ulang
+  sebagai teks biasa.
 - Anomali yang belum selesai TIDAK ditulis ulang ke ledger setiap siklus;
   ledger hanya mencatat kejadian baru. Setelah karantina berhasil, hash
   baru berkas masuk ke baseline, sehingga berkas yang sama berhenti
