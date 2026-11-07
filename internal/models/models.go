@@ -23,7 +23,45 @@ const (
 	// temuan pemindaian, tetapi tetap masuk ledger agar tindakan manual
 	// tercatat dan tidak bisa dihapus tanpa merusak hash-chain.
 	ActionReleased = "RELEASED"
+	// Aksi administratif (sejak v1.6.0, T-03): tindakan operator yang
+	// dicatat di ledger agar jejak "siapa, kapan, apa" bersifat append-only
+	// dan ikut terlindungi hash-chain v2. Bukan anomali pemindaian — tidak
+	// dihitung sebagai anomali di GetDashboardCounts dan tidak memicu
+	// alert Telegram.
+	ActionBaselineInit    = "BASELINE_INIT"
+	ActionBaselineUpdate  = "BASELINE_UPDATE"
+	ActionMonitoringStart = "MONITORING_START"
+	ActionMonitoringStop  = "MONITORING_STOP"
+	ActionMaintenanceOn   = "MAINTENANCE_ON"
+	ActionMaintenanceOff  = "MAINTENANCE_OFF"
+	ActionSettingsChanged = "SETTINGS_CHANGED"
+	ActionAuditorSet      = "AUDITOR_SET"
+	// ActionQuarantineBreach mencatat pembatalan karantina oleh pemilik
+	// berkas (sejak v1.6.0, T-01): berkas yang tercatat dikarantina
+	// ternyata izinnya sudah dipulihkan (mis. chmod 644 oleh www-data)
+	// sehingga dapat dibaca/dijalankan lagi, padahal hash dan izinnya sama
+	// dengan baseline dan perbandingan biasa tidak memicu event apa pun.
+	// OldMode pada aksi ini selalu 000 (izin yang seharusnya berlaku saat
+	// dikarantina); NewMode adalah izin yang ditemukan saat pemeriksaan.
+	ActionQuarantineBreach = "QUARANTINE_BREACH"
 )
+
+// AdminBlockPath adalah FilePath yang dipakai blok aksi administratif:
+// tidak ada berkas yang terlibat, jadi dipakai penanda yang bisa dicari
+// di Audit Trail.
+const AdminBlockPath = "[admin]"
+
+// IsAnomalyAction membedakan temuan pemindaian (dihitung sebagai anomali
+// dan memicu alert) dari tindakan manual/administratif (RELEASED dan
+// aksi administratif T-03) yang hanya dicatat di ledger.
+func IsAnomalyAction(action string) bool {
+	switch action {
+	case ActionCreated, ActionModified, ActionModeChanged, ActionQuarantineBreach, ActionDeleted, ActionUnreadable:
+		return true
+	default:
+		return false
+	}
+}
 
 // Block adalah unit data pada Private Ledger. Bersifat append-only dan
 // terhubung ke blok sebelumnya melalui PrevBlockHash sehingga membentuk
@@ -36,16 +74,42 @@ type Block struct {
 	OldHash   string    `json:"old_hash"`
 	NewHash   string    `json:"new_hash"`
 	// OldMode/NewMode adalah izin berkas (perm bits, mis. 0644) sebelum dan
-	// sesudah kejadian. Dipakai aksi MODE_CHANGED; untuk aksi lain diisi
-	// bila diketahui. Seperti QuarantineErr, keduanya TIDAK ikut dihitung
-	// ke dalam block hash (lihat calculateBlockHash) agar rantai lama tetap
-	// terverifikasi; nilainya bersifat metadata tampilan.
+	// sesudah kejadian. Dipakai aksi MODE_CHANGED dan QUARANTINE_BREACH;
+	// untuk aksi lain diisi bila diketahui. Pada blok v1 keduanya TIDAK
+	// ikut dihitung ke dalam block hash (metadata tampilan saja); pada
+	// blok v2 keduanya ikut dihitung (lihat calculateBlockHashV2).
 	OldMode       uint32 `json:"old_mode,omitempty"`
 	NewMode       uint32 `json:"new_mode,omitempty"`
 	Quarantined   bool   `json:"quarantined"`
 	QuarantineErr string `json:"quarantine_err,omitempty"`
+	// Actor adalah pelaku aksi administratif (nama pengguna, peran, dan IP
+	// klien — diisi sejak T-03; kosong untuk temuan pemindaian). Ikut
+	// dihitung ke dalam hash blok v2, agar jejak "siapa" tidak bisa
+	// diubah tanpa merusak rantai.
+	Actor string `json:"actor,omitempty"`
+	// Detail adalah keterangan bebas tentang aksi (mis. alasan pelepasan
+	// karantina — diisi sejak T-03). Ikut dihitung ke dalam hash blok v2.
+	Detail string `json:"detail,omitempty"`
+	// BaselineDigest adalah SHA-256 atas seluruh isi baseline pada saat
+	// blok ini ditulis (hanya pada BASELINE_INIT/BASELINE_UPDATE, sejak
+	// v1.6.0, T-04). Ikut dihitung ke dalam hash blok v3, sehingga
+	// perubahan diam-diam pada baseline dapat dideteksi dengan
+	// membandingkan digest ini dengan digest baseline saat ini.
+	BaselineDigest string `json:"baseline_digest,omitempty"`
+	// BaselineCount adalah jumlah berkas dalam baseline pada saat blok
+	// ini ditulis. Ikut dihitung ke dalam hash blok v3.
+	BaselineCount int    `json:"baseline_count,omitempty"`
 	PrevBlockHash string `json:"prev_block_hash"`
 	BlockHash     string `json:"block_hash"`
+	// HashVersion adalah versi formula block hash. 0 (field tidak ada) =
+	// v1: formula lama dengan pemisah "|" yang hanya melindungi
+	// ID|Timestamp|FilePath|Action|OldHash|NewHash|PrevBlockHash|
+	// Quarantined. 2 = v2 (sejak v1.6.0): encoding length-prefixed yang
+	// melindungi seluruh field kejadian. 3 = v3 (sejak v1.6.0, T-04): v2
+	// ditambah BaselineDigest dan BaselineCount. Tidak ada versi 1 — v1
+	// adalah ketiadaan field ini, agar blok produksi lama tetap
+	// terverifikasi tanpa perubahan apa pun.
+	HashVersion int `json:"hash_version,omitempty"`
 }
 
 // FileRecord adalah snapshot integritas file yang disimpan di bucket baseline.
@@ -89,6 +153,14 @@ type AnomalyEvent struct {
 	// Tidak ikut dihitung ke dalam block hash karena Block tidak memilikinya;
 	// alasan tetap disalin ke QuarantineErr saat block dibuat.
 	ScanErr string
+	// Actor/Detail dibawa ke Block untuk aksi administratif (T-03): siapa
+	// yang melakukan dan mengapa. Kosong untuk temuan pemindaian.
+	Actor  string
+	Detail string
+	// BaselineDigest/BaselineCount dibawa ke Block untuk aksi baseline
+	// (T-04): digest dan jumlah berkas baseline yang baru dibuat.
+	BaselineDigest string
+	BaselineCount  int
 }
 
 // ScanMetric adalah data telemetri satu siklus scan.
@@ -106,9 +178,30 @@ type ScanMetric struct {
 	Quarantined   int    `json:"quarantined"`
 	// SkippedOversize menghitung file non-kode >50 MB yang dilewati pada
 	// siklus ini (isinya tidak diperiksa; lihat ErrFileOversize).
-	SkippedOversize int    `json:"skipped_oversize,omitempty"`
-	Skipped         bool   `json:"skipped,omitempty"`
-	SkipReason      string `json:"skip_reason,omitempty"`
+	SkippedOversize int `json:"skipped_oversize,omitempty"`
+	// ExcludedFiles menghitung berkas yang dikecualikan dari deteksi pada
+	// siklus ini (exclude_globs atau kebijakan uploads, T-05). Angka ini
+	// harus terlihat di dasbor agar pengecualian tidak menjadi blind
+	// spot diam-diam.
+	ExcludedFiles int    `json:"excluded_files,omitempty"`
+	Skipped       bool   `json:"skipped,omitempty"`
+	SkipReason    string `json:"skip_reason,omitempty"`
+}
+
+// LastVerification adalah hasil verifikasi terjadwal terakhir (T-06,
+// v1.6.0): rantai + digest baseline. Disimpan di bucket meta agar
+// bertahan melewati restart dan bisa ditampilkan dasbor ("terakhir
+// diverifikasi") serta dibandingkan dengan jangkar eksternal (Telegram).
+type LastVerification struct {
+	VerifiedAt      time.Time `json:"verified_at"`
+	ChainValid      bool      `json:"chain_valid"`
+	ChainMessage    string    `json:"chain_message"`
+	HeadBlockID     string    `json:"head_block_id,omitempty"`
+	HeadHash        string    `json:"head_hash"`
+	TotalBlocks     int       `json:"total_blocks"`
+	BaselineMatch   bool      `json:"baseline_match"`
+	BaselineBlockID string    `json:"baseline_block_id,omitempty"`
+	BaselineMessage string    `json:"baseline_message"`
 }
 
 type AppConfig struct {

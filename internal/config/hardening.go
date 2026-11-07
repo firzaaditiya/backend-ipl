@@ -93,12 +93,25 @@ func checkSecrets(c *Config) error {
 // field yang berasal dari environment (tercatat di envOverrides) diizinkan;
 // hanya field yang benar-benar berasal dari config.json yang ditolak.
 //
+// PENGECUALIAN AUDITOR (T-07): hash bcrypt auditor di config.json
+// DIIZINKAN. Auditor dibuat saat runtime lewat API SetupAuditor, dan user
+// daemon (fim-ipl) tidak bisa menulis ke fim.env (root:root 0600),
+// sehingga memindahkan auditor ke env akan merusak alur setup. Hash bcrypt
+// bukan kredensial yang bisa dipakai — tidak bisa ditempel ke form login;
+// yang bisa dilakukan penyerang hanyalah brute-force offline, yang
+// ditahan oleh biaya bcrypt. Password auditor PLAINTEXT di config.json
+// tetap ditolak (migrasi di Load mengubahnya menjadi hash sebelum
+// pemeriksaan ini berjalan).
+//
 // Konsekuensi yang harus dipahami penguji: mode ini TIDAK kompatibel dengan
-// penyimpanan Telegram/Auditor lewat Settings API, karena API itu memang
-// menulis ke config.json. Deployment yang memakai Settings API (seperti
-// produksi TPQ Al-Fawwaz) harus mematikan flag ini dan menerima config.json
-// (0600, milik fim-ipl) sebagai sumber kebenaran runtime untuk Telegram dan
-// Auditor, sementara JWT secret + password admin tetap dari fim.env.
+// penyimpanan Telegram lewat Settings API, karena API itu memang menulis
+// ke config.json. Deployment yang memakai Settings API (seperti produksi
+// TPQ Al-Fawwaz sebelum T-07) harus mematikan flag ini dan menerima
+// config.json (0600, milik fim-ipl) sebagai sumber kebenaran runtime
+// untuk Telegram, sementara JWT secret + password admin tetap dari
+// fim.env. Sejak langkah produksi T-07, Telegram dikelola lewat fim.env
+// dan flag ini aktif di produksi; UpdateSettings menolak perubahan
+// Telegram bila sumbernya env (lihat settings.go).
 func checkExternalSecrets(c *Config) error {
 	if os.Getenv("FIM_REQUIRE_EXTERNAL_SECRETS") != "1" {
 		return nil
@@ -113,7 +126,7 @@ func checkExternalSecrets(c *Config) error {
 	if c.AdminPassword != "" && !fromEnv("admin_password") {
 		fields = append(fields, "admin_password")
 	}
-	if c.AuditorPassword != "" && !fromEnv("auditor_password") {
+	if c.AuditorPassword != "" && !fromEnv("auditor_password") && !isBcryptHash(c.AuditorPassword) {
 		fields = append(fields, "auditor_password")
 	}
 	if c.TelegramToken != "" && !fromEnv("telegram_token") {

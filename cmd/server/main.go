@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -61,6 +63,7 @@ func main() {
 	log.Println("[FIM-IPL] Ledger initialized")
 
 	sc := scanner.New(cfg.GetWorkerCount(), cfg.GetWatchPaths())
+	sc.SetExcludeGlobs(cfg.GetExcludeGlobs())
 	log.Println("[FIM-IPL] Scanner initialized")
 
 	tg := notifier.NewTelegram(cfg.TelegramToken, cfg.TelegramChatID)
@@ -81,6 +84,11 @@ func main() {
 	alertJobs := make(chan alertJob, 64)
 	alertStop := make(chan struct{})
 	startAlertWorker(tg, alertJobs, alertStop)
+
+	// Verifikasi rantai terjadwal (T-06): sekali per jam, plus sekali
+	// sesaat setelah boot agar rantai langsung terverifikasi dan status
+	// "terakhir diverifikasi" segera tersedia di dasbor.
+	startVerificationLoop(db, alertJobs, alertStop)
 
 	sc.RegisterScanCycle(func() {
 		runFullScanCycle(sc, db, bm, hub, alertJobs)
@@ -228,6 +236,83 @@ func startAlertWorker(tg *notifier.Telegram, jobs <-chan alertJob, stop <-chan s
 	}()
 }
 
+// verificationInterval adalah jeda verifikasi rantai terjadwal (T-06).
+// Verifikasi pertama berjalan 1 menit setelah boot (bukan langsung —
+// daemon butuh waktu menyelesaikan auto-resume monitoring), lalu setiap
+// jam. Interval ini sengaja konstanta, bukan konfigurasi: jangkar
+// eksternal hanya bermakna bila verifikasinya berjalan tanpa perlu
+// diingat operator.
+const verificationInterval = time.Hour
+
+const verificationFirstDelay = time.Minute
+
+// startVerificationLoop menjalankan verifikasi rantai + digest baseline
+// secara berkala di goroutine terpisah. Hasilnya dicatat (lihat
+// runVerification) dan ditampilkan dasbor sebagai "terakhir
+// diverifikasi". Kegagalan RANTAI memicu alert Telegram URGENT —
+// ketidakcocokan digest baseline TIDAK dialert: perubahan sah (unggahan,
+// update plugin) memang membuat digest usang sampai rebuild, dan alert
+// untuk itu hanya akan melatih operator mengabaikan alert.
+func startVerificationLoop(db *ledger.Ledger, alertJobs chan<- alertJob, stop <-chan struct{}) {
+	go func() {
+		timer := time.NewTimer(verificationFirstDelay)
+		defer timer.Stop()
+		ticker := time.NewTicker(verificationInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-timer.C:
+				runVerification(db, alertJobs)
+			case <-ticker.C:
+				runVerification(db, alertJobs)
+			case <-stop:
+				return
+			}
+		}
+	}()
+}
+
+// runVerification memeriksa rantai dan digest baseline, mencatat hasilnya
+// (bertahan melewati restart), dan mengirim alert bila rantai rusak.
+// Mengembalikan hasil yang dicatat, agar bisa diuji tanpa worker.
+func runVerification(db *ledger.Ledger, alertJobs chan<- alertJob) models.LastVerification {
+	chain := db.VerifyChain()
+	baseline, berr := db.VerifyBaselineDigest()
+
+	lv := models.LastVerification{
+		VerifiedAt:      chain.VerifiedAt,
+		ChainValid:      chain.Valid,
+		ChainMessage:    chain.Message,
+		HeadBlockID:     chain.HeadBlockID,
+		HeadHash:        chain.HeadHash,
+		TotalBlocks:     chain.TotalBlocks,
+		BaselineMatch:   berr == nil && baseline.Match,
+		BaselineBlockID: baseline.BlockID,
+		BaselineMessage: baseline.Message,
+	}
+	if berr != nil {
+		lv.BaselineMessage = berr.Error()
+	}
+	if err := db.RecordVerification(lv); err != nil {
+		log.Printf("[Verify] Failed to record verification: %v", err)
+	}
+
+	if !chain.Valid {
+		log.Printf("[Verify] CHAIN INVALID at %s: %s", chain.FailedBlock, chain.Message)
+		enqueueAlert(alertJobs, alertJob{
+			kind:  "system",
+			title: "RANTAI LEDGER RUSAK",
+			message: fmt.Sprintf("Verifikasi rantai terjadwal GAGAL pada %s: %s. Block terakhir: %s, head hash: %s. Segera periksa ledger — jangan jalankan baseline/update sebelum penyebabnya jelas.",
+				chain.FailedBlock, chain.Message, chain.HeadBlockID, chain.HeadHash),
+		})
+	} else if !lv.BaselineMatch {
+		log.Printf("[Verify] Chain OK (%d blocks, head %s); baseline mismatch: %s", chain.TotalBlocks, chain.HeadBlockID, lv.BaselineMessage)
+	} else {
+		log.Printf("[Verify] Chain OK (%d blocks, head %s); baseline match", chain.TotalBlocks, chain.HeadBlockID)
+	}
+	return lv
+}
+
 // enqueueAlert mengirim pekerjaan ke antrean tanpa pernah memblokir
 // pipeline scan. Bila antrean penuh (64 pekerjaan tertunda — jauh di atas
 // volume normal ~5 per siklus), pekerjaan dibuang dan dicatat di log.
@@ -334,6 +419,69 @@ func isQuarantineEffective(info os.FileInfo) bool {
 	return info.Mode().Perm()&0o444 == 0
 }
 
+// detectQuarantineBreaches memeriksa ulang setiap berkas yang tercatat
+// dikarantina (T-01, v1.6.0). Tanpa langkah ini, pemulihan izin oleh pemilik
+// berkas lolos diam-diam: setelah karantina berhasil, baseline menyimpan
+// hash dan mode hasil scan SEBELUM chmod 000, sehingga chmod kembali ke
+// mode asli membuat hash dan mode sama persis dengan baseline dan
+// perbandingan biasa tidak memicu event apa pun — sementara ledger tetap
+// menyatakan berkas terkarantina.
+//
+// Pemeriksaan memakai definisi "karantina berlaku" yang sama dengan
+// filterActiveQuarantine (isQuarantineEffective): berkas dianggap dibobol
+// bila dapat dibaca atau dijalankan lagi. Berkas yang hanya bisa ditulis
+// (mis. 0200) tetap dianggap karantina berlaku karena tidak dapat dibaca
+// maupun dijalankan; begitu izinnya dipulihkan penuh, MODIFIED atau breach
+// akan menangkapnya pada siklus itu.
+//
+// Hanya path TANPA event perbandingan yang diperiksa: bila perbandingan
+// sudah menghasilkan event (mis. MODIFIED karena isi ikut berubah), alur
+// normal yang menangani — termasuk karantina ulang — sehingga tidak ada
+// blok ganda untuk satu kejadian. Berkas yang hilang dilewati: DELETED
+// sudah ditangani perbandingan. OldMode selalu 000 (izin yang seharusnya
+// berlaku saat dikarantina); NewMode adalah izin yang ditemukan di disk.
+func detectQuarantineBreaches(baseline map[string]models.FileRecord, quarantined map[string]bool, eventPaths map[string]bool, scanMap map[string]models.ScanResult) []models.AnomalyEvent {
+	if len(quarantined) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(quarantined))
+	for p := range quarantined {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	var breaches []models.AnomalyEvent
+	for _, path := range paths {
+		if eventPaths[path] {
+			continue
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			continue
+		}
+		if isQuarantineEffective(info) {
+			continue
+		}
+		ev := models.AnomalyEvent{
+			FilePath: path,
+			Action:   models.ActionQuarantineBreach,
+			OldMode:  0,
+			NewMode:  uint32(info.Mode().Perm()),
+		}
+		if rec, ok := baseline[path]; ok {
+			ev.OldHash = rec.Hash
+		}
+		if sr, ok := scanMap[path]; ok {
+			ev.NewHash = sr.Hash
+			if sr.Err != nil {
+				ev.ScanErr = sr.Err.Error()
+			}
+		}
+		breaches = append(breaches, ev)
+	}
+	return breaches
+}
+
 // runFullScanCycle adalah pipeline eksekusi satu siklus scan:
 //
 //	metrics.Start()  →  scanner.Scan()  →  compare  →  quarantine  →  ledger.AppendBlock  →  metrics.Finish → saveMetric  →  broadcast SSE  →  telegram alert (async, via antrean)  →  optional backup
@@ -426,8 +574,7 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, bm *backup.Manager
 	}
 
 	// 3) Compare (paralelisme pembanding mengikuti konfigurasi worker).
-	compareResult := scanner.CompareWithBaseline(results, baseline, sc.WorkerCount())
-	totalAnomalies := compareResult.TotalAnomalies()
+	compareResult := scanner.CompareWithBaseline(results, baseline, sc.WorkerCount(), sc.Exclusions())
 
 	// Adopsi mode baseline lama (Mode == 0, dari sebelum v1.5.0): satu
 	// transaksi, tanpa event — agar perubahan izin pada siklus berikutnya
@@ -443,19 +590,12 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, bm *backup.Manager
 	if compareResult.SkippedOversize > 0 {
 		log.Printf("[Scan] %d file(s) skipped (oversize >50 MB, non-kode): isi tidak diperiksa", compareResult.SkippedOversize)
 	}
-
-	if totalAnomalies == 0 {
-		log.Println("[Scan] Scan complete. No anomalies detected.")
-		m := cycle.Finish(len(results), 0, 0)
-		m.SkippedOversize = compareResult.SkippedOversize
-		_ = db.SaveMetric(m)
-		broadcastScan(hub, m)
-		return
+	if compareResult.ExcludedFiles > 0 {
+		log.Printf("[Scan] %d file(s) excluded from detection (exclude_globs / uploads policy)", compareResult.ExcludedFiles)
 	}
 
-	log.Printf("[Scan] ALERT: %d anomalies detected!", totalAnomalies)
-
-	// Map hasil scan untuk lookup
+	// Map hasil scan untuk lookup (dipakai deteksi breach dan pembaruan
+	// baseline di bawah).
 	scanMap := make(map[string]models.ScanResult, len(results))
 	for _, r := range results {
 		if r.Err == nil {
@@ -463,12 +603,67 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, bm *backup.Manager
 		}
 	}
 
+	// Berkas yang dikecualikan (T-05) tetap masuk baseline agar terlacak
+	// dan tercakup digest — yang tidak terjadi hanyalah event dan
+	// karantina. Entri ditulis hanya bila berkasnya baru atau berubah
+	// (bandingkan dengan baseline), agar siklus yang tenang tidak menulis
+	// ulang seluruh baseline setiap kali.
+	for _, path := range compareResult.Excluded {
+		sr, ok := scanMap[path]
+		if !ok {
+			continue
+		}
+		if rec, exists := baseline[path]; exists && rec.Hash == sr.Hash && rec.Mode == sr.Mode && rec.Size == sr.Size {
+			continue
+		}
+		record := models.FileRecord{
+			Path:      sr.Path,
+			Hash:      sr.Hash,
+			Mode:      sr.Mode,
+			Size:      sr.Size,
+			ModTime:   sr.ModTime,
+			ScannedAt: time.Now(),
+		}
+		if err := db.UpdateBaselineEntry(record); err != nil {
+			log.Printf("[Scan] Failed to update baseline entry for excluded file %s: %v", path, err)
+		}
+	}
+
+	// 3b) Verifikasi karantina (T-01, v1.6.0): pembatalan karantina oleh
+	// pemilik berkas tidak menghasilkan event perbandingan, jadi periksa
+	// ulang lewat Lstat. Event breach digabung ke daftar event agar
+	// dikarantina ulang, dicatat di ledger, dan dialert seperti anomali
+	// lain; bila tidak ada event sama sekali, siklus tetap berakhir
+	// sebagai "No anomalies detected".
+	eventPaths := make(map[string]bool, len(compareResult.AllEvents()))
+	for _, ev := range compareResult.AllEvents() {
+		eventPaths[ev.FilePath] = true
+	}
+	breachEvents := detectQuarantineBreaches(baseline, quarantinedPaths, eventPaths, scanMap)
+	if len(breachEvents) > 0 {
+		log.Printf("[Scan] ALERT: %d quarantine breach(es) detected!", len(breachEvents))
+	}
+	allEvents := append(compareResult.AllEvents(), breachEvents...)
+	totalAnomalies := compareResult.TotalAnomalies() + len(breachEvents)
+
+	if totalAnomalies == 0 {
+		log.Println("[Scan] Scan complete. No anomalies detected.")
+		m := cycle.Finish(len(results), 0, 0)
+		m.SkippedOversize = compareResult.SkippedOversize
+		m.ExcludedFiles = compareResult.ExcludedFiles
+		_ = db.SaveMetric(m)
+		broadcastScan(hub, m)
+		return
+	}
+
+	log.Printf("[Scan] ALERT: %d anomalies detected!", totalAnomalies)
+
 	// 4) Quarantine + AppendBlock (per event)
 	var blocks []*models.Block
 	var quarantinedCount int
 	var quarantineFailures []notifier.QuarantineFailure
 
-	for _, event := range compareResult.AllEvents() {
+	for _, event := range allEvents {
 		// Karantina untuk CREATED/MODIFIED/MODE_CHANGED/UNREADABLE.
 		// DELETED tidak punya file.
 		attemptQuarantine := event.Action != models.ActionDeleted
@@ -585,11 +780,12 @@ func runFullScanCycle(sc *scanner.Scanner, db *ledger.Ledger, bm *backup.Manager
 	recorded := len(blocks)
 	m := cycle.Finish(len(results), recorded, quarantinedCount)
 	m.SkippedOversize = compareResult.SkippedOversize
+	m.ExcludedFiles = compareResult.ExcludedFiles
 	if err := db.SaveMetric(m); err != nil {
 		log.Printf("[Metrics] Failed to save: %v", err)
 	}
-	log.Printf("[Metrics] cycle: elapsed=%dms mem_alloc=%.2fMB files=%d anomalies=%d quarantined=%d skipped_oversize=%d",
-		m.ElapsedMs, float64(m.MemAllocBytes)/1024.0/1024.0, m.FilesScanned, m.Anomalies, m.Quarantined, m.SkippedOversize)
+	log.Printf("[Metrics] cycle: elapsed=%dms mem_alloc=%.2fMB files=%d anomalies=%d quarantined=%d skipped_oversize=%d excluded=%d",
+		m.ElapsedMs, float64(m.MemAllocBytes)/1024.0/1024.0, m.FilesScanned, m.Anomalies, m.Quarantined, m.SkippedOversize, m.ExcludedFiles)
 	broadcastScan(hub, m)
 
 	// 6) Telegram alerts — async lewat antrean (lihat startAlertWorker):

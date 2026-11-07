@@ -5,7 +5,7 @@
 
 FIM-IPL Backend adalah daemon File Integrity Monitoring (FIM) dan REST API
 untuk memantau perubahan file pada server web. Sistem membandingkan hash
-SHA-256 dengan baseline, mencatat kejadian ke Immutable Private Ledger lokal,
+SHA-256 dengan baseline, mencatat kejadian ke Tamper-Evident Private Ledger lokal,
 menonaktifkan file baru atau berubah (termasuk file sah, sampai diperiksa
 operator), dan mengirim notifikasi operasional.
 
@@ -44,14 +44,16 @@ dan Windows, serta tidak kehilangan perubahan ketika daemon restart.
 - Worker pool untuk pemindaian paralel (hashing dan perbandingan baseline
   memakai `worker_count` yang sama, 1–16).
 - Aksi `CREATED`, `MODIFIED`, `MODE_CHANGED` (perubahan izin saja, sejak
-  v1.5.0), `DELETED`, dan `UNREADABLE`.
+  v1.5.0), `QUARANTINE_BREACH` (karantina dibatalkan pemilik berkas, sejak
+  v1.6.0), `DELETED`, dan `UNREADABLE`.
 - Karantina Linux dengan `chmod 000`.
 - Karantina Windows dengan best-effort ReadOnly attribute.
-- Immutable Private Ledger lokal berbasis Bbolt dan hash-chain. "Immutable"
-  di sini berarti append-only + hash-chain di tingkat aplikasi pada satu
-  node, BUKAN tahan terhadap penyerang dengan akses root — root dapat
-  menulis ulang file Bbolt. Karena itu backup off-host wajib dipakai (lihat
-  §Batasan).
+- Tamper-Evident Private Ledger lokal berbasis Bbolt dan hash-chain.
+  "Tamper-Evident" di sini berarti append-only + hash-chain di tingkat
+  aplikasi pada satu node: perubahan retroaktif pada entri yang sudah
+  di-anchor dapat TERDETEKSI saat verifikasi, BUKAN mustahil dilakukan —
+  root dapat menulis ulang file Bbolt dan menghitung ulang rantai. Karena
+  itu backup off-host dan anchoring eksternal wajib dipakai (lihat §Batasan).
 - Verifikasi hash-chain lokal; head hash diekspor untuk perbandingan manual
   off-box (tidak ada verifikasi otomatis terhadap salinan eksternal).
 - Export dan backup ledger ke Telegram/webhook.
@@ -306,6 +308,267 @@ pertama setelah upgrade, mode setiap berkas diadopsi diam-diam ke baseline
 dilaporkan `MODE_CHANGED` sekaligus. Adopsi ini dicatat di log server
 ("Adopted modes for N baseline file(s)").
 
+## Verifikasi karantina per siklus (QUARANTINE_BREACH) (v1.6.0)
+
+`MODE_CHANGED` saja tidak menutup satu celah: setelah karantina berhasil,
+baseline menyimpan hash dan mode hasil scan SEBELUM `chmod 000`. Bila
+pemilik berkas (mis. `www-data`) mengembalikan izin ke mode aslinya,
+hash dan mode sama persis dengan baseline — perbandingan biasa tidak
+memicu kejadian apa pun, sementara ledger tetap menyatakan berkas
+terkarantina. Celah ini terbukti lewat reproduksi (T-01): berkas yang
+dikarantina dikembalikan ke 0644 dan dua siklus berikutnya mencatat
+"No anomalies detected", padahal berkas sudah bisa dipakai lagi.
+
+Sejak v1.6.0, setiap siklus memeriksa ulang semua path yang tercatat
+dikarantina (daftar dari `GetCurrentlyQuarantinedPaths`) dengan `Lstat`
+— tanpa hashing ulang:
+
+- Berkas yang izinnya tidak lagi berlaku (dapat dibaca atau dijalankan
+  lagi) dicatat sebagai blok `QUARANTINE_BREACH` dengan `old_hash ==
+  new_hash` (isi tidak berubah), `old_mode` 000, dan `new_mode` izin
+  yang ditemukan di disk; lalu dikarantina ulang (`chmod 000`) dan
+  dikirim alert Telegram berlabel URGENT.
+- Berkas yang hanya bisa ditulis (mis. 0200) tetap dianggap karantina
+  berlaku, karena tidak dapat dibaca maupun dijalankan; begitu izinnya
+  dipulihkan penuh, `MODIFIED` atau breach akan menangkapnya.
+- Bila perbandingan sudah menghasilkan event untuk path itu (mis.
+  `MODIFIED` karena isi ikut berubah), event itulah yang diproses —
+  tidak ada blok ganda untuk satu kejadian. Berkas yang hilang dilewati
+  (`DELETED` sudah ditangani perbandingan).
+- Baseline TIDAK diubah oleh breach: baseline sudah menyimpan hash dan
+  mode yang benar. Satu pemilik yang mengembalikan izin setiap siklus
+  menghasilkan satu blok breach per siklus — itu disengaja: setiap
+  pembatalan adalah kejadian tersendiri yang harus terlihat.
+
+Batas yang tetap berlaku: pemilik berkas selalu bisa mengembalikan izin,
+jadi selalu ada jendela sampai satu interval scan sebelum breach
+terdeteksi dan karantina diterapkan ulang. Yang diperbaiki adalah
+keheningan: breach kini tercatat, terlihat, dan dikarantina ulang.
+
+## Formula hash blok v2 (hash_version) (v1.6.0)
+
+Formula hash v1 (v1.0–v1.5.0) hanya melindungi
+`ID|Timestamp|FilePath|Action|OldHash|NewHash|PrevBlockHash|Quarantined`,
+dengan pemisah `|` yang tidak di-escape. Dua celah: (1) `OldMode`,
+`NewMode`, dan `QuarantineErr` tidak masuk material hash — pada
+`MODE_CHANGED`, `OldHash == NewHash`, jadi perubahan izin itu sendiri
+tidak terlindungi sama sekali; (2) path yang mengandung `|` bisa
+dipalsukan menjadi field lain.
+
+Sejak v1.6.0, setiap blok baru memakai formula v2 (`hash_version: 2`):
+
+- Material hash mencakup SELURUH field kejadian: ID, Timestamp,
+  FilePath, Action, OldHash, NewHash, OldMode, NewMode, Quarantined,
+  QuarantineErr, Actor, Detail, PrevBlockHash, dan HashVersion sendiri.
+- Encoding-nya length-prefixed (`panjang:nilai` per field, urutan
+  tetap), sehingga batas field tidak pernah ambigu.
+- `VerifyChain` memilih formula per blok dari `hash_version`-nya.
+  Blok lama tanpa field itu (v1) diverifikasi dengan formula lama yang
+  tidak berubah — 29 blok produksi v1.5.0 tetap valid tanpa migrasi.
+  Versi formula yang tidak dikenal ditolak (rantai gagal di blok itu),
+  bukan diam-diam diverifikasi dengan formula lama.
+
+Catatan untuk T-03: field `Actor` dan `Detail` sudah masuk material
+hash v2 sejak sekarang (kosong untuk temuan pemindaian), sehingga saat
+T-03 mulai mengisinya untuk aksi administratif, formula tidak perlu
+berubah lagi.
+
+## Formula hash blok v3 dan digest baseline (v1.6.0, T-04)
+
+Sejak v1.6.0, blok baru memakai formula v3 (`hash_version: 3`): v2
+ditambah `BaselineDigest` dan `BaselineCount`. Setiap versi formula
+tidak pernah diubah setelah didefinisikan — kebutuhan baru memakai versi
+baru, sehingga blok v1 dan v2 yang sudah ada tetap terverifikasi dengan
+formula lamanya (rantai campuran v1→v2→v3 terverifikasi di instance uji).
+
+Baseline hidup di bucket Bbolt yang tidak masuk hash-chain, sehingga
+root yang mengedit satu entri baseline secara langsung tidak merusak
+rantai. Digest menutup celah itu:
+
+- Setiap blok `BASELINE_INIT`/`BASELINE_UPDATE` membawa SHA-256 atas
+  seluruh isi baseline pada saat itu, dalam format kanonis satu baris
+  per berkas `path|hash|mode|size` (mode dan size desimal, diurutkan
+  berdasarkan path), beserta jumlah berkasnya. Digest ikut dihitung ke
+  dalam hash blok v3.
+- `GET /api/v1/ledger/verify-baseline` (read-only, Auditor boleh)
+  membandingkan digest blok baseline terakhir dengan digest baseline
+  saat ini. Ketidakcocokan berarti ada entri yang berubah di luar jalur
+  resmi. Verifikasi ini melengkapi `VerifyChain` — rantai yang valid
+  tidak menjamin baseline tidak diubah, dan sebaliknya.
+- Mode pemulihan karantina (`GetQuarantineMode`) kini bersumber dari
+  RANTAI — mode pada blok karantina terakhir untuk path itu — bukan
+  hanya dari bucket `quarantine_modes` yang mutable. Bucket hanya
+  dipakai sebagai fallback untuk karantina lama yang bloknya tidak
+  membawa mode. Unit test membuktikan manipulasi langsung pada bucket
+  tidak lagi mengubah mode yang dipulihkan.
+
+## Aksi administratif di ledger (v1.6.0)
+
+Sejak v1.6.0, setiap endpoint mutasi mencatat satu blok audit ke ledger
+selain menjalankan aksinya (pola yang sama seperti `RELEASED`):
+
+| Endpoint | Aksi | Detail |
+|---|---|---|
+| `POST /baseline/init` | `BASELINE_INIT` | `baseline dibuat: N berkas` |
+| `POST /baseline/update` | `BASELINE_UPDATE` | alasan wajib dari operator |
+| `POST /monitoring/start` | `MONITORING_START` | `interval X detik, Y worker` |
+| `POST /monitoring/stop` | `MONITORING_STOP` | — |
+| `POST /maintenance/enable` | `MAINTENANCE_ON` | — |
+| `POST /maintenance/disable` | `MAINTENANCE_OFF` | — |
+| `POST /settings` | `SETTINGS_CHANGED` | nama field yang diubah SAJA (tidak pernah nilainya) |
+| `POST /setup/auditor` | `AUDITOR_SET` | `auditor: <username>` |
+| `POST /quarantine/release` | `RELEASED` | alasan wajib dari operator |
+
+- **Actor** diisi `username (Peran) dari IP`, dibaca dari klaim JWT di
+  awal handler — sebelum mutasi — karena mengatur auditor menaikkan
+  epoch sesi dan membuat token pemanggil tidak valid lagi.
+- **Alasan wajib** (1–500 karakter) berlaku untuk pelepasan karantina
+  dan baseline/update; tanpa alasan, endpoint menolak 400. Alasan
+  tersimpan permanen di ledger.
+- Blok aksi administratif memakai `file_path` penanda `"[admin]"` karena
+  tidak ada berkas yang terlibat; mudah dicari di Audit Trail.
+- **Perubahan definisi "Anomalies" (penting untuk naskah):** sejak
+  v1.6.0, `total_anomalies` di `GET /dashboard/stats` hanya menghitung
+  temuan pemindaian (`CREATED`, `MODIFIED`, `MODE_CHANGED`,
+  `QUARANTINE_BREACH`, `DELETED`, `UNREADABLE`). Blok `RELEASED` dan
+  aksi administratif TIDAK dihitung. Angka historis v1.0–v1.5.0 tidak
+  berubah (belum ada blok admin saat itu), tetapi angka setelah v1.6.0
+  tidak lagi bisa dibandingkan mentah dengan angka lama tanpa catatan
+  ini. Respons mutasi membawa `"audited": true/false` (false bila
+  pencatatan ke ledger gagal; aksinya sendiri tetap berjalan).
+- Auditor yang ditolak 403 oleh router tidak pernah mencapai handler,
+  sehingga tidak menghasilkan blok apa pun.
+
+## Aturan pengecualian dan kebijakan uploads (v1.6.0, T-05)
+
+Tanpa pengecualian, sistem dapat merusak situsnya sendiri: setiap berkas
+baru yang sah — cache plugin, staging update WordPress, gambar yang
+diunggah — terdeteksi CREATED lalu dikarantina chmod 000. Dua lapis
+aturan mencegahnya:
+
+1. **`exclude_globs`** (konfigurasi, diubah lewat Settings API):
+   pola path yang dikecualikan SELURUHNYA dari deteksi. Default
+   `wp-content/cache/**` dan `wp-content/upgrade/**`. Pola memakai
+   `**` untuk subdirektori apa pun; pola tidak valid ditolak 400.
+   Perubahan tercatat di ledger sebagai `SETTINGS_CHANGED` (hanya nama
+   field). Daftar kosong eksplisit berarti tidak ada pengecualian glob.
+2. **Kebijakan uploads** (bawaan, tidak dapat dimatikan): berkas
+   NON-KODE di bawah `wp-content/uploads/**` dikecualikan — gambar,
+   dokumen, media yang diunggah lewat WordPress. Berkas yang menyerupai
+   kode (`.php`, `.php.*`, `.phtml`, `.phar`, `.htaccess`, `.user.ini`,
+   dan sejenisnya — lihat `isCodeLike`) TETAP dipantau dan dikarantina,
+   karena uploads adalah jalur klasik webshell.
+
+Pengecualian bukan blind spot diam-diam:
+
+- Berkas yang dikecualikan TETAP masuk baseline (ditulis tanpa event
+  saat siklus menemukannya) — jadi terlacak dan tercakup digest baseline
+  (T-04). Menghapus pengecualian kemudian tidak menimbulkan banjir
+  CREATED palsu.
+- Jumlah berkas yang dikecualikan per siklus dicatat di metrik
+  (`excluded_files`), ditampilkan di dasbor (baris "Siklus terakhir")
+  dan di `GET /dashboard/stats`.
+- Setelah perubahan sah (unggahan, update plugin), baseline berubah di
+  luar rebuild — `verify-baseline` akan melaporkan mismatch sampai
+  operator melakukan maintenance + rebuild baseline (SOP yang sama
+  seperti perubahan sah lainnya).
+
+Bukti produksi (5 Nov 2026): seluruh 29 blok ledger produksi diperiksa
+— 7 blok CREATED, SEMUANYA dari simulasi (`fim-sim-*.php`), **0 blok
+CREATED di luar simulasi**. Artinya, sampai v1.5.0, situs belum pernah
+mengalami "self-DoS" nyata; pengecualian ini adalah pencegahan, bukan
+perbaikan atas insiden.
+
+## Manajemen secret (v1.6.0, T-07)
+
+Kredensial deployment dikelola lewat environment (`/etc/fim-ipl/fim.env`,
+root:root 0600), bukan lewat `config.json`:
+
+- **JWT secret, password admin, token + chat ID Telegram**: dari fim.env.
+  `FIM_REQUIRE_EXTERNAL_SECRETS=1` membuat boot GAGAL bila ada kredensial
+  plaintext di config.json (pemeriksaan sadar sumber — nilai dari env
+  diizinkan). Settings API dan UI menolak perubahan Telegram bila
+  sumbernya env (kolom dinonaktifkan, pesan menjelaskan harus mengubah
+  fim.env + restart).
+- **Hash bcrypt auditor di config.json DIIZINKAN** (pengecualian): auditor
+  dibuat saat runtime lewat API SetupAuditor, dan user daemon (fim-ipl)
+  tidak bisa menulis fim.env yang root:root 0600 — memindahkan auditor ke
+  env akan merusak alur setup. Hash bukan kredensial yang bisa dipakai
+  (tidak bisa ditempel ke form login); brute-force offline ditahan biaya
+  bcrypt. Password auditor plaintext tetap ditolak.
+- **Bug Load yang diperbaiki (T-07)**: boot pertama tanpa config.json
+  selalu menulis secret JWT acak ke disk walau env sudah menyediakan
+  `FIM_JWT_SECRET`. Sekarang file config tidak dibuat bila env menyediakan
+  secret-nya; tanpa env, secret acak tetap dibuat dan disimpan agar sesi
+  stabil melewati restart.
+- **Rotasi** (dilakukan operator, BUKAN oleh kode): token Telegram yang
+  pernah ditempel di chat, password admin/auditor, dan JWT secret harus
+  dirotasi — token lewat BotFather, password lewat Settings API / fim.env,
+  JWT secret lewat fim.env (semua sesi lama batal).
+
+### Unit systemd repo vs produksi (T-07)
+
+Unit di repo (`deploy/fim-ipl.service`) adalah template lengkap. Unit
+produksi (`/etc/systemd/system/fim-ipl.service`) sama secara efektif,
+tetapi dibagi dua file (sejarah: CAP_FOWNER ditemukan belakangan):
+
+| | Repo (template) | Produksi |
+|---|---|---|
+| `FIM_REQUIRE_EXTERNAL_SECRETS` | `=1` | BELUM ADA — diaktifkan saat langkah produksi T-07 (Telegram pindah ke fim.env; butuh persetujuan eksplisit sebelum deploy) |
+| `FIM_COOKIE_SECURE` | `=1` (di unit) | `=1` (di `override.conf`) |
+| `CAP_FOWNER` (bounding + ambient) | di unit | di `override.conf` |
+| `SupplementaryGroups=www-data` | di unit | di `override.conf` |
+| `ReadWritePaths` | `/opt/fim-ipl/data /var/www/html` (satu baris) | `/opt/fim-ipl/data` (unit) + `/var/www/html` (override) |
+| `fim.env` | contoh di `deploy/fim-ipl.env.example` | `FIM_JWT_SECRET, FIM_ADMIN_PASSWORD, FIM_TELEGRAM_TOKEN, FIM_TELEGRAM_CHAT_ID, FIM_TRUST_PROXY` |
+
+Bila suatu saat unit produksi ditulis ulang dari template, drop-in
+`override.conf` tidak lagi diperlukan (isinya sudah ada di template) —
+tetapi JANGAN menghapus drop-in sebelum memverifikasi `systemctl cat
+fim-ipl` menunjukkan nilai yang sama.
+
+## Jangkar eksternal dan verifikasi terjadwal (v1.6.0, T-06)
+
+Ledger di satu node punya batas yang tidak bisa dihapus oleh kriptografi
+apa pun: **verifikasi lokal tidak dapat mendeteksi pemotongan ekor**
+(tail truncation). Menghapus blok-blok terakhir menghasilkan rantai yang
+lebih pendek tetapi tetap utuh — hash-chain hanya membuktikan tidak ada
+yang diubah DI DALAM rantai yang tersisa, bukan bahwa tidak ada yang
+dihapus. Yang mendeteksinya adalah **jangkar eksternal**: salinan head
+hash di luar server. Karena itu:
+
+- **Setiap alert Telegram membawa jangkar.** Alert per-blok (≤3 anomali
+  per siklus) mencantumkan `Block hash` LENGKAP (64 heksa). Ringkasan
+  batch dan peringatan massal mencantumkan ID + hash pendek tiap blok
+  serta `Block terakhir` + `Hash rantai` lengkap. Caption backup ledger
+  mencantumkan `Block terakhir` + `Head hash`. Bila head hash di Telegram
+  tidak sama dengan head hash rantai saat ini, ada blok yang hilang —
+  walau verifikasi lokal melaporkan "chain intact".
+- **Verifikasi terjadwal.** Daemon memeriksa rantai + digest baseline
+  1 menit setelah boot, lalu setiap jam, dan mencatat hasilnya (bertahan
+  melewati restart). Dasbor menampilkan "Terakhir diverifikasi" (waktu,
+  status rantai, head block). Rantai yang RUSAK memicu alert Telegram
+  URGENT (`RANTAI LEDGER RUSAK`). Ketidakcocokan digest baseline TIDAK
+  dialert — perubahan sah (unggahan, update plugin) memang membuat digest
+  usang sampai rebuild; alert untuk itu hanya akan melatih operator
+  mengabaikan alert. Status ketidakcocokan tetap terlihat di dasbor.
+- **Verifier mandiri `cmd/verify`.** `fim-verify <export.json>`
+  menghitung ulang rantai dari file ekspor JSON tanpa membuka database,
+  memakai logika yang persis sama dengan server (formula v1/v2/v3).
+  Kode keluar 0 = utuh, 1 = rusak, 2 = pemakaian/file salah. Cocok untuk
+  audit di mesin lain atau di luar server.
+- **HMAC blok TIDAK ditambahkan** (sengaja): kunci yang disimpan di
+  server yang sama tidak menghentikan penyerang dengan akses root — yang
+  lebih bernilai adalah jangkar eksternal per kejadian di atas.
+
+Perbaikan yang ditemukan saat menguji T-06 (bug T-04 yang ikut
+diperbaiki di sini): `scanAndSaveBaseline` tidak mencatat `Mode` berkas,
+sehingga setiap rebuild menulis Mode 0 untuk semua berkas; siklus
+berikutnya mengadopsi mode diam-diam dan digest berubah tepat setelah
+rebuild — verify-baseline selalu mismatch sampai rebuild berikutnya.
+Sejak perbaikan ini, rebuild mencatat mode dan digest stabil melewati
+siklus (diuji: rebuild → match=true, satu siklus kemudian tetap
+match=true).
+
 ## Backup & notifikasi
 
 - Backup ledger (export JSON) berjalan otomatis setiap 24 jam dan saat
@@ -539,6 +802,46 @@ klien bila `FIM_TRUST_PROXY=1`.
 Menyembunyikan atau mengganti nama `config.json` bukan kontrol keamanan.
 Kontrol yang benar adalah permission, user OS terpisah, secret eksternal,
 localhost binding, dan backup off-host.
+
+### Batas sumber daya systemd (v1.6.0, T-08)
+
+Sebelumnya unit systemd tidak punya batas apa pun: angka memori di naskah
+hanya klaim, bukan penegakan. Unit repo kini menetapkan:
+
+- `MemoryMax=256M` — daemon yang lepas kendali (mis. kebocoran memori
+  saat scan) tidak bisa menekan PHP-FPM sampai situs mati.
+- `CPUWeight=10` dan `Nice=10` — bila CPU diperebutkan, scheduler
+  mendahulukan PHP-FPM.
+- `IOSchedulingClass=idle` — I/O scan mengalah pada I/O web.
+
+Batas ini **diukur, bukan ditebak** (5 Nov 2026, 23:32–23:39 WIB,
+instance uji terpisah dengan salinan 3.901 berkas produksi, 1 vCPU,
+2 GB RAM; produksi tidak disentuh):
+
+| Ukuran | Hasil |
+|---|---|
+| RSS daemon saat scan 3.901 berkas (100 sampel/detik) | min 17,8 MB, rata-rata 20,8 MB, maks 21,9 MB |
+| RSS daemon produksi (di antara siklus) | 23,4 MB |
+| HeapAlloc Go di akhir siklus | 4,4–8,8 MB |
+| Durasi satu siklus scan 3.901 berkas | 881–1.307 ms (~1 detik) |
+| CPU daemon saat scan | puncak 52–71% dari 1 vCPU selama ~1 detik |
+| Latensi WordPress (probe bootstrap PHP-FPM, 100 request) | rata-rata 17 ms, p95 28 ms, maks 119 ms |
+| Latensi WordPress selama siklus scan (n=4) | rata-rata 47 ms, maks 61 ms |
+| Latensi WordPress selama siklus produksi (n=1) | 14 ms (tidak ada perlambatan terukur) |
+
+MemoryMax=256M memberi ruang ~11x dari RSS maksimum yang terukur
+(23,4 MB) dengan tetap menjadi batas nyata. Efek scan terhadap WordPress
+terukur dalam puluhan milidetik dan hanya selama ~1 detik per siklus
+(120 detik di produksi) — tetapi sampel "selama siklus" memang sedikit
+(n=4 dan n=1) karena jendelanya hanya ~1 detik; klaim yang jujur adalah
+efeknya kecil, bukan nol. Skala ~20.000 berkas belum diuji (bagian dari
+paket bukti v1.6.0).
+
+Unit repo sudah lolos `systemd-analyze verify` (tidak ada keluhan untuk
+unit ini). **Penerapan ke unit produksi butuh persetujuan eksplisit**
+(edit unit + `daemon-reload` + restart) — belum dilakukan. Bila daemon
+mati karena OOM (exit 137 / "memory cgroup out of memory" di journal),
+naikkan MemoryMax setelah mengukur ulang — jangan menghapus batasnya.
 
 ## API Utama
 

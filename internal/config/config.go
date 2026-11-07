@@ -65,6 +65,13 @@ type Config struct {
 	ScanIntervalSec int      `json:"scan_interval_sec"`
 	WorkerCount     int      `json:"worker_count"`
 
+	// ExcludeGlobs adalah pola path yang dikecualikan dari deteksi (T-05,
+	// v1.6.0), relatif terhadap watch root ("wp-content/cache/**") atau
+	// absolut. Default: direktori cache dan staging update WordPress.
+	// Daftar kosong eksplisit berarti tidak ada pengecualian glob (tetapi
+	// kebijakan uploads bawaan tetap berlaku — lihat scanner/exclude.go).
+	ExcludeGlobs []string `json:"exclude_globs"`
+
 	TelegramToken  string `json:"telegram_token"`
 	TelegramChatID string `json:"telegram_chat_id"`
 
@@ -86,6 +93,11 @@ var (
 	once     sync.Once
 )
 
+// DefaultExcludeGlobs adalah pola pengecualian bawaan T-05: direktori
+// cache plugin dan staging update WordPress. Dipakai DefaultConfig dan
+// sebagai fallback bila config.json berisi "exclude_globs": null.
+var DefaultExcludeGlobs = []string{"wp-content/cache/**", "wp-content/upgrade/**"}
+
 func DefaultConfig() *Config {
 	return &Config{
 		ServerPort:        ":8080",
@@ -98,9 +110,13 @@ func DefaultConfig() *Config {
 		WatchPaths:        []string{},
 		ScanIntervalSec:   300,
 		WorkerCount:       4,
-		TelegramToken:     "",
-		TelegramChatID:    "",
-		DBPath:            "./data/fim.db",
+		// Default pengecualian T-05: cache plugin dan staging update
+		// WordPress — direktori yang isinya berubah sendiri setiap saat
+		// dan tidak pernah berisi kode yang dieksekusi langsung.
+		ExcludeGlobs:   append([]string(nil), DefaultExcludeGlobs...),
+		TelegramToken:  "",
+		TelegramChatID: "",
+		DBPath:         "./data/fim.db",
 	}
 }
 
@@ -112,23 +128,7 @@ func Load(path string) (*Config, error) {
 
 		data, readErr := os.ReadFile(path)
 		if readErr != nil {
-			secret, secretErr := generateRandomSecret()
-			if secretErr != nil {
-				err = secretErr
-				return
-			}
-			instance.JWTSecret = secret
-			err = Save(path, instance)
-			applyEnvOverrides(instance)
-			if secretErr := checkSecrets(instance); secretErr != nil && err == nil {
-				err = secretErr
-			}
-			if webhookErr := checkWebhookURL(instance); webhookErr != nil && err == nil {
-				err = webhookErr
-			}
-			if deploymentErr := checkLocalAPI(instance); deploymentErr != nil && err == nil {
-				err = deploymentErr
-			}
+			err = initFreshConfig(instance, path)
 			return
 		}
 
@@ -189,6 +189,34 @@ func Load(path string) (*Config, error) {
 	return instance, err
 }
 
+// initFreshConfig menangani boot pertama tanpa config.json. Rahasia JWT
+// acak HANYA dibuat dan disimpan bila environment TIDAK menyediakan
+// FIM_JWT_SECRET (T-07): sebelumnya secret acak selalu ditulis ke disk
+// walau env sudah menyediakan secret — meninggalkan secret usang di
+// config.json yang bukan secret yang dipakai, dan membingungkan operator
+// (serta membuat file config ada padahal deployment 100% env tidak
+// membutuhkannya).
+func initFreshConfig(instance *Config, path string) error {
+	if os.Getenv("FIM_JWT_SECRET") == "" {
+		secret, err := generateRandomSecret()
+		if err != nil {
+			return err
+		}
+		instance.JWTSecret = secret
+		if err := Save(path, instance); err != nil {
+			return err
+		}
+	}
+	applyEnvOverrides(instance)
+	if err := checkSecrets(instance); err != nil {
+		return err
+	}
+	if err := checkWebhookURL(instance); err != nil {
+		return err
+	}
+	return checkLocalAPI(instance)
+}
+
 // applyEnvOverrides menerapkan konfigurasi sensitif dari environment setelah
 // file config dibaca. Nilai dari environment TIDAK ditulis balik ke disk,
 // sehingga deployment (systemd/Docker) bisa menyimpan rahasia di secret
@@ -208,6 +236,13 @@ func Load(path string) (*Config, error) {
 //
 // Yang TIDAK punya env override dan hanya diatur lewat config.json atau
 // Settings API: watch_paths dan login_path.
+// ApplyEnvOverrides menerapkan override environment ke config (dipakai
+// saat boot lewat Load, dan oleh pengujian untuk menandai field yang
+// berasal dari environment).
+func (c *Config) ApplyEnvOverrides() {
+	applyEnvOverrides(c)
+}
+
 func applyEnvOverrides(c *Config) {
 	if v := os.Getenv("FIM_SERVER_PORT"); v != "" {
 		c.ServerPort = v
@@ -426,6 +461,21 @@ func (c *Config) GetAllowedOrigins() []string {
 	return origins
 }
 
+// GetExcludeGlobs mengembalikan pola pengecualian (salinan). Nilai nil
+// (mis. config.json berisi "exclude_globs": null) dianggap belum diatur
+// dan diganti default, agar daemon tidak berjalan tanpa pengecualian
+// hanya karena satu kunci null.
+func (c *Config) GetExcludeGlobs() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.ExcludeGlobs == nil {
+		return append([]string(nil), DefaultExcludeGlobs...)
+	}
+	globs := make([]string, len(c.ExcludeGlobs))
+	copy(globs, c.ExcludeGlobs)
+	return globs
+}
+
 func (c *Config) IsAdminConfigured() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -449,11 +499,18 @@ type Snapshot struct {
 	WatchPaths        []string `json:"watch_paths"`
 	ScanIntervalSec   int      `json:"scan_interval_sec"`
 	WorkerCount       int      `json:"worker_count"`
+	ExcludeGlobs      []string `json:"exclude_globs"`
 	TelegramToken     string   `json:"telegram_token"`
 	TelegramChatID    string   `json:"telegram_chat_id"`
-	BackupWebhookURL  string   `json:"backup_webhook_url"`
-	AllowedOrigins    []string `json:"allowed_origins"`
-	DBPath            string   `json:"db_path"`
+	// Sumber kredensial Telegram (T-07): true bila nilainya berasal dari
+	// environment (fim.env), bukan dari config.json/Settings API. Dipakai
+	// GetSettings agar UI bisa menonaktifkan kolom Telegram yang dikelola
+	// env, dan UpdateSettings untuk menolak perubahan atasnya.
+	TelegramTokenFromEnv  bool     `json:"telegram_token_from_env"`
+	TelegramChatIDFromEnv bool     `json:"telegram_chat_id_from_env"`
+	BackupWebhookURL      string   `json:"backup_webhook_url"`
+	AllowedOrigins        []string `json:"allowed_origins"`
+	DBPath                string   `json:"db_path"`
 }
 
 func (c *Config) Snapshot() Snapshot {
@@ -466,26 +523,39 @@ func (c *Config) Snapshot() Snapshot {
 	origins := make([]string, len(c.AllowedOrigins))
 	copy(origins, c.AllowedOrigins)
 
+	// Nilai nil ("exclude_globs": null di config.json) diganti default,
+	// sama seperti GetExcludeGlobs, agar API tidak pernah mengembalikan
+	// null untuk field ini.
+	globs := c.ExcludeGlobs
+	if globs == nil {
+		globs = DefaultExcludeGlobs
+	}
+	globsCopy := make([]string, len(globs))
+	copy(globsCopy, globs)
+
 	return Snapshot{
-		ServerPort:        c.ServerPort,
-		JWTSecret:         c.JWTSecret,
-		LoginPath:         c.LoginPath,
-		CookieSecure:      c.CookieSecure,
-		MonitoringEnabled: c.MonitoringEnabled,
-		SessionEpoch:      c.SessionEpoch,
-		WebhookSecret:     c.WebhookSecret,
-		AdminUsername:     c.AdminUsername,
-		AdminPassword:     c.AdminPassword,
-		AuditorUsername:   c.AuditorUsername,
-		AuditorPassword:   c.AuditorPassword,
-		WatchPaths:        paths,
-		ScanIntervalSec:   c.ScanIntervalSec,
-		WorkerCount:       c.WorkerCount,
-		TelegramToken:     c.TelegramToken,
-		TelegramChatID:    c.TelegramChatID,
-		BackupWebhookURL:  c.BackupWebhookURL,
-		AllowedOrigins:    origins,
-		DBPath:            c.DBPath,
+		ServerPort:            c.ServerPort,
+		JWTSecret:             c.JWTSecret,
+		LoginPath:             c.LoginPath,
+		CookieSecure:          c.CookieSecure,
+		MonitoringEnabled:     c.MonitoringEnabled,
+		SessionEpoch:          c.SessionEpoch,
+		WebhookSecret:         c.WebhookSecret,
+		AdminUsername:         c.AdminUsername,
+		AdminPassword:         c.AdminPassword,
+		AuditorUsername:       c.AuditorUsername,
+		AuditorPassword:       c.AuditorPassword,
+		WatchPaths:            paths,
+		ScanIntervalSec:       c.ScanIntervalSec,
+		WorkerCount:           c.WorkerCount,
+		ExcludeGlobs:          globsCopy,
+		TelegramToken:         c.TelegramToken,
+		TelegramChatID:        c.TelegramChatID,
+		TelegramTokenFromEnv:  c.envOverrides["telegram_token"],
+		TelegramChatIDFromEnv: c.envOverrides["telegram_chat_id"],
+		BackupWebhookURL:      c.BackupWebhookURL,
+		AllowedOrigins:        origins,
+		DBPath:                c.DBPath,
 	}
 }
 

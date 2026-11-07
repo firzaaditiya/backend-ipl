@@ -361,17 +361,34 @@ func formatAlertMessage(block *models.Block) string {
 	}
 
 	var b strings.Builder
-	b.WriteString("FIM-IPL: PERUBAHAN FILE TERDETEKSI\n\n")
+	if block.Action == models.ActionQuarantineBreach {
+		b.WriteString("FIM-IPL: URGENT - KARANTINA DIBATALKAN\n\n")
+	} else {
+		b.WriteString("FIM-IPL: PERUBAHAN FILE TERDETEKSI\n\n")
+	}
 	fmt.Fprintf(&b, "Block        : %s\n", cleanText(block.ID))
+	// Hash blok LENGKAP (T-06): jangkar eksternal. Bila rantai di server
+	// dipotong ekornya, head hash di Telegram tidak akan cocok dengan
+	// head hash rantai saat ini — itulah yang mendeteksi pemotongan yang
+	// tidak bisa dideteksi verifikasi lokal.
+	fmt.Fprintf(&b, "Block hash   : %s\n", cleanText(block.BlockHash))
 	fmt.Fprintf(&b, "Waktu        : %s\n", formatTimestamp(block.Timestamp))
 	fmt.Fprintf(&b, "Aksi         : %s\n", actionLabel(block.Action))
 	fmt.Fprintf(&b, "File         : %s\n", cleanText(block.FilePath))
 	fmt.Fprintf(&b, "Status file  : %s\n", quarantineStatus(block))
 	fmt.Fprintf(&b, "Hash sebelum : %s\n", truncateHash(block.OldHash))
 	fmt.Fprintf(&b, "Hash sesudah : %s\n", truncateHash(block.NewHash))
+	if block.Action == models.ActionModeChanged || block.Action == models.ActionQuarantineBreach {
+		fmt.Fprintf(&b, "Izin sebelum  : %04o\n", block.OldMode)
+		fmt.Fprintf(&b, "Izin sesudah  : %04o\n", block.NewMode)
+	}
 
 	b.WriteString("\nTindakan yang disarankan:\n")
 	switch {
+	case block.Action == models.ActionQuarantineBreach:
+		b.WriteString("1. URGENT: file yang sudah dikarantina diaktifkan lagi oleh pemiliknya; sistem sudah mengarantina ulang secara otomatis.\n")
+		b.WriteString("2. Cari tahu siapa/apa yang mengubah izin file (akun www-data, proses web, atau penyerang yang menguasai akun itu).\n")
+		b.WriteString("3. Jangan lepas karantina sebelum penyebabnya jelas; bila pemilik sah yang mengubah, perbaiki lewat maintenance mode + baseline/update.\n")
 	case block.Action == models.ActionDeleted:
 		b.WriteString("1. Pastikan penghapusan file memang dilakukan oleh admin atau proses resmi.\n")
 		b.WriteString("2. Jika tidak dikenal, pulihkan file dari backup terakhir.\n")
@@ -411,10 +428,16 @@ func formatBatchMessage(blocks []*models.Block, total int) string {
 			continue
 		}
 		listed++
-		fmt.Fprintf(&b, "%d. %s - %s\n", listed, actionLabel(block.Action), cleanText(block.FilePath))
+		fmt.Fprintf(&b, "%d. %s - %s (%s, hash %s)\n", listed, actionLabel(block.Action), cleanText(block.FilePath), cleanText(block.ID), truncateHash(block.BlockHash))
 	}
 	if remaining := total - listed; remaining > 0 {
 		fmt.Fprintf(&b, "... dan %d file lainnya.\n", remaining)
+	}
+	// Jangkar eksternal (T-06): blok terakhir + hash rantai penuh, agar
+	// pemotongan ekor terdeteksi dari Telegram walau verifikasi lokal
+	// terhadap rantai yang terpotong tetap lolos.
+	if head := headBlock(blocks); head != nil {
+		fmt.Fprintf(&b, "\nBlock terakhir : %s\nHash rantai     : %s\n", cleanText(head.ID), cleanText(head.BlockHash))
 	}
 
 	b.WriteString("\nDetail lengkap tersedia di dashboard, menu Audit Trail.")
@@ -437,11 +460,33 @@ func formatBulkWarningMessage(total int, blocks []*models.Block) string {
 	b.WriteString("- Pemasangan atau penghapusan plugin\n")
 	b.WriteString("- Operasi massal oleh administrator\n")
 
+	// Jangkar eksternal (T-06): lihat formatBatchMessage.
+	if head := headBlock(blocks); head != nil {
+		fmt.Fprintf(&b, "\nBlock terakhir : %s\nHash rantai     : %s\n", cleanText(head.ID), cleanText(head.BlockHash))
+	}
+
 	b.WriteString("\nTindakan:\n")
 	b.WriteString("1. Jika sedang melakukan update, aktifkan maintenance mode.\n")
 	b.WriteString("2. Jika tidak ada aktivitas admin, periksa dashboard dan log akses server.\n")
 	b.WriteString("3. Backup ledger otomatis dijalankan untuk anomali kritis.\n")
 	return b.String()
+}
+
+// headBlock mengembalikan blok dengan ID terbesar (blok terakhir rantai)
+// dari daftar, atau nil bila daftar kosong. Blok-blok yang masuk alert
+// diurutkan menaik berdasarkan ID, tetapi pencarian eksplisit lebih aman
+// daripada mengandalkan urutan.
+func headBlock(blocks []*models.Block) *models.Block {
+	var head *models.Block
+	for _, block := range blocks {
+		if block == nil {
+			continue
+		}
+		if head == nil || block.ID > head.ID {
+			head = block
+		}
+	}
+	return head
 }
 
 func countActions(blocks []*models.Block) (modified, created, deleted, unreadable int) {
@@ -473,6 +518,8 @@ func actionLabel(action string) string {
 		return "DELETED (file dihapus)"
 	case models.ActionUnreadable:
 		return "UNREADABLE (file tidak dapat dipindai)"
+	case models.ActionQuarantineBreach:
+		return "QUARANTINE_BREACH (karantina dibatalkan pemilik berkas)"
 	case models.ActionReleased:
 		return "RELEASED (karantina dilepas)"
 	default:

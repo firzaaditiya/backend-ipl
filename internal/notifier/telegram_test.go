@@ -324,3 +324,84 @@ func TestParseRetryAfter(t *testing.T) {
 		t.Fatalf("invalid body should yield 0, got %v", got)
 	}
 }
+
+func TestFormatAlertMessageQuarantineBreachIsUrgent(t *testing.T) {
+	block := testBlock("/var/www/html/wp-config.php", models.ActionQuarantineBreach, true)
+	block.OldMode = 0
+	block.NewMode = 0o644
+	block.OldHash = strings.Repeat("c", 64)
+	block.NewHash = strings.Repeat("c", 64)
+
+	msg := formatAlertMessage(block)
+
+	for _, want := range []string{
+		"FIM-IPL: URGENT - KARANTINA DIBATALKAN",
+		"QUARANTINE_BREACH (karantina dibatalkan pemilik berkas)",
+		"Izin sebelum  : 0000",
+		"Izin sesudah  : 0644",
+		"mengarantina ulang secara otomatis",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("message missing %q:\n%s", want, msg)
+		}
+	}
+	for _, r := range msg {
+		if r > 127 {
+			t.Fatalf("message must not contain emoji/non-ASCII characters: %q", msg)
+		}
+	}
+}
+
+func TestFormatAlertMessageIncludesFullBlockHash(t *testing.T) {
+	// T-06: setiap alert per-blok membawa hash blok LENGKAP sebagai
+	// jangkar eksternal — bukan hanya ID blok.
+	block := testBlock("/var/www/x.php", models.ActionCreated, true)
+	block.ID = "BLK-000018"
+	block.BlockHash = strings.Repeat("d", 64)
+
+	msg := formatAlertMessage(block)
+
+	if !strings.Contains(msg, "Block        : BLK-000018") {
+		t.Fatalf("per-block alert must contain the block ID:\n%s", msg)
+	}
+	if !strings.Contains(msg, "Block hash   : "+strings.Repeat("d", 64)) {
+		t.Fatalf("per-block alert must contain the FULL block hash:\n%s", msg)
+	}
+	// ASCII saja (aturan yang sudah ada untuk semua pesan alert).
+	for _, r := range msg {
+		if r > 127 {
+			t.Fatalf("alert must be ASCII-only, found %q", r)
+		}
+	}
+}
+
+func TestFormatBatchMessageIncludesBlockIDsAndHeadHash(t *testing.T) {
+	// T-06: ringkasan batch mencantumkan ID + hash pendek tiap blok dan
+	// head hash LENGKAP di akhir, agar pemotongan ekor terdeteksi dari
+	// Telegram.
+	blocks := []*models.Block{
+		{ID: "BLK-000001", FilePath: "/var/www/a.php", Action: models.ActionCreated, BlockHash: strings.Repeat("a", 64), Quarantined: true},
+		{ID: "BLK-000002", FilePath: "/var/www/b.php", Action: models.ActionModified, BlockHash: strings.Repeat("b", 64), Quarantined: true},
+		{ID: "BLK-000003", FilePath: "/var/www/c.php", Action: models.ActionDeleted, BlockHash: strings.Repeat("c", 64)},
+		{ID: "BLK-000004", FilePath: "/var/www/d.php", Action: models.ActionCreated, BlockHash: strings.Repeat("d", 64), Quarantined: true},
+	}
+
+	msg := formatBatchMessage(blocks, 4)
+
+	for _, id := range []string{"BLK-000001", "BLK-000002", "BLK-000003", "BLK-000004"} {
+		if !strings.Contains(msg, id) {
+			t.Fatalf("batch alert must list block ID %s:\n%s", id, msg)
+		}
+	}
+	if !strings.Contains(msg, "Block terakhir : BLK-000004") {
+		t.Fatalf("batch alert must name the head block:\n%s", msg)
+	}
+	if !strings.Contains(msg, "Hash rantai     : "+strings.Repeat("d", 64)) {
+		t.Fatalf("batch alert must contain the FULL head hash:\n%s", msg)
+	}
+
+	bulk := formatBulkWarningMessage(60, blocks)
+	if !strings.Contains(bulk, "Block terakhir : BLK-000004") || !strings.Contains(bulk, strings.Repeat("d", 64)) {
+		t.Fatalf("bulk alert must contain the head block ID and full head hash:\n%s", bulk)
+	}
+}

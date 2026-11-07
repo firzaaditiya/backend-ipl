@@ -1,0 +1,5 @@
+run,instance,files,interval_sec,samples,rss_min_mb,rss_avg_mb,rss_max_mb,heapalloc_min_mb,heapalloc_max_mb,cycle_ms_min,cycle_ms_max,cpu_max_pct_1vcpu,wp_latency_avg_ms,wp_latency_p95_ms,wp_latency_max_ms,wp_during_cycle_n,wp_during_cycle_avg_ms,wp_during_cycle_max_ms,notes
+run1,synthetic-3901,3901,30,100,17.8,20.8,21.9,6.6,8.8,881,1112,52,17,28,119,4,47,61,"WP latency = probe bootstrap PHP-FPM (respons 301 WordPress); siklus sintetik tiap 30 dtk"
+run1,production,3901,120,100,23.4,23.4,23.4,4.4,5.0,1030,1307,0,17,28,119,0,,"RSS produksi diukur di antara siklus (tidak ada siklus produksi di jendela run1); CPU 0% karena tidak ada siklus di jendela"
+run2,production,3901,120,40,23.4,23.4,23.4,4.4,5.0,1018,1134,71,15,20,30,1,14,14,"40 request di sekitar siklus produksi 23:38:48 WIB (elapsed 1134 ms); 1 request jatuh di jendela siklus"
+run3,synthetic-20k,19505,30,100,38.8,57.5,62.6,29.0,36.7,4382,5124,76,20,56,93,,"5 salinan pohon produksi (631 MB); baseline init 6,9 dtk; deteksi CREATED terverifikasi (dibuat 00:07:32 -> blok 00:08:06, delay ~34 dtk = interval 30 + siklus ~5 dtk)"

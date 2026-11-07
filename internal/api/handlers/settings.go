@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"github.com/skripsi/fim-ipl/internal/backup"
 	"github.com/skripsi/fim-ipl/internal/config"
 	"github.com/skripsi/fim-ipl/internal/ledger"
+	"github.com/skripsi/fim-ipl/internal/models"
 	"github.com/skripsi/fim-ipl/internal/notifier"
 	"github.com/skripsi/fim-ipl/internal/realtime"
 	"github.com/skripsi/fim-ipl/internal/scanner"
@@ -72,16 +74,21 @@ func (h *SettingsHandler) GetSettings(w http.ResponseWriter, r *http.Request) {
 
 	settings := map[string]interface{}{
 		"watch_paths":         snap.WatchPaths,
+		"exclude_globs":       snap.ExcludeGlobs,
 		"scan_interval_sec":   snap.ScanIntervalSec,
 		"worker_count":        snap.WorkerCount,
 		"telegram_chat_id":    telegramChatID,
 		"telegram_configured": h.notifier.IsConfigured(),
-		"backup_webhook_url":  backupWebhookURL,
-		"allowed_origins":     snap.AllowedOrigins,
-		"is_monitoring":       h.scanner.IsRunning(),
-		"maintenance_mode":    h.scanner.IsMaintenance(),
-		"auditor_username":    snap.AuditorUsername,
-		"auditor_configured":  snap.AuditorUsername != "" && snap.AuditorPassword != "",
+		// Sumber kredensial Telegram (T-07): UI menonaktifkan kolom
+		// Telegram bila nilainya berasal dari environment (fim.env).
+		"telegram_token_from_env":   snap.TelegramTokenFromEnv,
+		"telegram_chat_id_from_env": snap.TelegramChatIDFromEnv,
+		"backup_webhook_url":        backupWebhookURL,
+		"allowed_origins":           snap.AllowedOrigins,
+		"is_monitoring":             h.scanner.IsRunning(),
+		"maintenance_mode":          h.scanner.IsMaintenance(),
+		"auditor_username":          snap.AuditorUsername,
+		"auditor_configured":        snap.AuditorUsername != "" && snap.AuditorPassword != "",
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -93,9 +100,11 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
+	actor := actorFromRequest(r, h.cfg, h.ledger)
 
 	var req struct {
 		WatchPaths       []string `json:"watch_paths"`
+		ExcludeGlobs     []string `json:"exclude_globs"`
 		ScanIntervalSec  int      `json:"scan_interval_sec"`
 		WorkerCount      int      `json:"worker_count"`
 		TelegramToken    string   `json:"telegram_token"`
@@ -123,6 +132,29 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
+	// Kredensial Telegram yang berasal dari environment (fim.env) tidak
+	// boleh diubah lewat API (T-07): nilai di config.json akan kalah
+	// dengan env pada boot berikutnya, dan dengan
+	// FIM_REQUIRE_EXTERNAL_SECRETS=1, menulis token ke config.json justru
+	// membuat boot berikutnya GAGAL. Tolak dengan pesan yang jelas, bukan
+	// diam-diam mengabaikan.
+	envSnap := h.cfg.Snapshot()
+	if req.TelegramToken != "" && envSnap.TelegramTokenFromEnv {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "telegram_token is managed via environment (fim.env); remove it from fim.env to manage it here"})
+		return
+	}
+	if req.TelegramChatID != nil && envSnap.TelegramChatIDFromEnv {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "telegram_chat_id is managed via environment (fim.env); remove it from fim.env to manage it here"})
+		return
+	}
+	// Pola pengecualian divalidasi sintaksnya sebelum disimpan (T-05):
+	// pola yang tidak valid tidak boleh masuk config.
+	if req.ExcludeGlobs != nil {
+		if err := scanner.ValidateGlobs(req.ExcludeGlobs); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+	}
 
 	watchPaths := req.WatchPaths
 	var err error
@@ -132,6 +164,36 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
+	}
+
+	// Nama field yang benar-benar diubah (T-03): hanya nama field, TIDAK
+	// pernah nilainya — nilai bisa berupa token atau rahasia. Urutan
+	// tetap sesuai struct request agar deterministik. Bila tidak ada
+	// field yang diubah, tidak ada blok audit (bukan mutasi).
+	var changed []string
+	if len(watchPaths) > 0 {
+		changed = append(changed, "watch_paths")
+	}
+	if req.ExcludeGlobs != nil {
+		changed = append(changed, "exclude_globs")
+	}
+	if req.ScanIntervalSec > 0 {
+		changed = append(changed, "scan_interval_sec")
+	}
+	if req.WorkerCount > 0 {
+		changed = append(changed, "worker_count")
+	}
+	if req.TelegramToken != "" {
+		changed = append(changed, "telegram_token")
+	}
+	if req.TelegramChatID != nil {
+		changed = append(changed, "telegram_chat_id")
+	}
+	if req.BackupWebhookURL != nil {
+		changed = append(changed, "backup_webhook_url")
+	}
+	if req.AllowedOrigins != nil {
+		changed = append(changed, "allowed_origins")
 	}
 
 	var origins []string
@@ -146,6 +208,12 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 	h.cfg.Update(func(c *config.Config) {
 		if len(watchPaths) > 0 {
 			c.WatchPaths = watchPaths
+		}
+		// ExcludeGlobs: nil = field tidak dikirim (biarkan nilai lama);
+		// array kosong eksplisit = hapus semua pola (kebijakan uploads
+		// bawaan tetap berlaku).
+		if req.ExcludeGlobs != nil {
+			c.ExcludeGlobs = req.ExcludeGlobs
 		}
 		if req.ScanIntervalSec > 0 {
 			c.ScanIntervalSec = req.ScanIntervalSec
@@ -185,7 +253,7 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 	}
 
 	snap := h.cfg.Snapshot()
-	h.scanner.UpdateConfig(snap.WorkerCount, snap.WatchPaths, snap.ScanIntervalSec)
+	h.scanner.UpdateConfig(snap.WorkerCount, snap.WatchPaths, snap.ScanIntervalSec, snap.ExcludeGlobs)
 	h.notifier.UpdateConfig(snap.TelegramToken, snap.TelegramChatID)
 	if h.backup != nil {
 		h.backup.UpdateWebhook(snap.BackupWebhookURL)
@@ -194,7 +262,13 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 	log.Println("[Settings] Configuration updated and saved")
 	publishState(h.hub, h.scanner, "settings_updated")
 
-	writeJSON(w, http.StatusOK, map[string]string{"message": "settings updated successfully"})
+	// Catat perubahan pengaturan ke ledger (T-03). Bila tidak ada field
+	// yang berubah, tidak ada blok (bukan mutasi).
+	resp := map[string]interface{}{"message": "settings updated successfully"}
+	if len(changed) > 0 {
+		resp["audited"] = appendAdminBlock(h.ledger, actor, models.ActionSettingsChanged, strings.Join(changed, ", "))
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (h *SettingsHandler) StartMonitoring(w http.ResponseWriter, r *http.Request) {
@@ -202,6 +276,7 @@ func (h *SettingsHandler) StartMonitoring(w http.ResponseWriter, r *http.Request
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
+	actor := actorFromRequest(r, h.cfg, h.ledger)
 
 	if h.scanner.IsRunning() {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "monitoring already running"})
@@ -233,7 +308,13 @@ func (h *SettingsHandler) StartMonitoring(w http.ResponseWriter, r *http.Request
 	log.Println("[Settings] Monitoring started")
 	publishState(h.hub, h.scanner, "monitoring_started")
 
-	writeJSON(w, http.StatusOK, map[string]string{"message": "monitoring started"})
+	snap := h.cfg.Snapshot()
+	audited := appendAdminBlock(h.ledger, actor, models.ActionMonitoringStart,
+		fmt.Sprintf("interval %d detik, %d worker", snap.ScanIntervalSec, snap.WorkerCount))
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "monitoring started",
+		"audited": audited,
+	})
 }
 
 func (h *SettingsHandler) StopMonitoring(w http.ResponseWriter, r *http.Request) {
@@ -241,6 +322,7 @@ func (h *SettingsHandler) StopMonitoring(w http.ResponseWriter, r *http.Request)
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
+	actor := actorFromRequest(r, h.cfg, h.ledger)
 
 	if !h.scanner.IsRunning() {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "monitoring not running"})
@@ -262,7 +344,11 @@ func (h *SettingsHandler) StopMonitoring(w http.ResponseWriter, r *http.Request)
 	log.Println("[Settings] Monitoring stopped")
 	publishState(h.hub, h.scanner, "monitoring_stopped")
 
-	writeJSON(w, http.StatusOK, map[string]string{"message": "monitoring stopped"})
+	audited := appendAdminBlock(h.ledger, actor, models.ActionMonitoringStop, "")
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "monitoring stopped",
+		"audited": audited,
+	})
 }
 
 func (h *SettingsHandler) InitializeBaseline(w http.ResponseWriter, r *http.Request) {
@@ -270,6 +356,7 @@ func (h *SettingsHandler) InitializeBaseline(w http.ResponseWriter, r *http.Requ
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
+	actor := actorFromRequest(r, h.cfg, h.ledger)
 
 	if h.scanner.IsRunning() {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "stop monitoring before re-initializing baseline"})
@@ -288,9 +375,23 @@ func (h *SettingsHandler) InitializeBaseline(w http.ResponseWriter, r *http.Requ
 	log.Printf("[Settings] Baseline initialized with %d files", total)
 	publishState(h.hub, h.scanner, "baseline_initialized")
 
+	// Digest baseline ikut dicatat di blok (T-04). Bila digest gagal
+	// dihitung (baca DB gagal — praktis tidak mungkin setelah rebuild
+	// berhasil), blok tetap dicatat tanpa digest agar jejak rebuild tidak
+	// hilang; VerifyBaselineDigest akan melaporkannya sebagai blok tanpa
+	// digest, bukan sebagai cocok.
+	detail := fmt.Sprintf("baseline dibuat: %d berkas", total)
+	audited := false
+	if digest, count, derr := h.ledger.BaselineDigest(); derr != nil {
+		log.Printf("[Settings] Baseline initialized but failed to compute digest: %v", derr)
+		appendAdminBlock(h.ledger, actor, models.ActionBaselineInit, detail)
+	} else {
+		audited = appendAdminBlockWithDigest(h.ledger, actor, models.ActionBaselineInit, detail, digest, count)
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message":     "baseline initialized successfully",
 		"total_files": total,
+		"audited":     audited,
 	})
 }
 

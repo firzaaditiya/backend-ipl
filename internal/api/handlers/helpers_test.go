@@ -4,6 +4,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/skripsi/fim-ipl/internal/ledger"
+	"github.com/skripsi/fim-ipl/internal/models"
+	"github.com/skripsi/fim-ipl/internal/scanner"
 )
 
 func TestValidateWatchPathsRejectsMissingDir(t *testing.T) {
@@ -143,5 +147,80 @@ func TestValidateOrigins(t *testing.T) {
 		if _, err := validateOrigins(origins); err == nil {
 			t.Fatalf("expected %v to be rejected", origins)
 		}
+	}
+}
+
+func TestScanAndSaveBaselineRecordsModes(t *testing.T) {
+	// Regresi T-06: rebuild baseline HARUS mencatat mode tiap berkas.
+	// Sebelum perbaikan, scanAndSaveBaseline menulis Mode 0 untuk semua
+	// berkas; siklus berikutnya mengadopsi mode diam-diam sehingga digest
+	// baseline berubah tepat setelah rebuild dan verify-baseline selalu
+	// mismatch sampai rebuild berikutnya.
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.php"), []byte("<?php // a"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b.php"), []byte("<?php // b"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	l, err := ledger.New(filepath.Join(t.TempDir(), "baseline.db"))
+	if err != nil {
+		t.Fatalf("ledger.New: %v", err)
+	}
+	defer l.Close()
+
+	sc := scanner.New(2, []string{root})
+	total, err := scanAndSaveBaseline(sc, l)
+	if err != nil {
+		t.Fatalf("scanAndSaveBaseline: %v", err)
+	}
+	if total != 2 {
+		t.Fatalf("total = %d, want 2", total)
+	}
+	baseline, err := l.GetBaseline()
+	if err != nil {
+		t.Fatalf("GetBaseline: %v", err)
+	}
+	if baseline[filepath.Join(root, "a.php")].Mode != 0o644 {
+		t.Fatalf("a.php mode = %04o, want 0644", baseline[filepath.Join(root, "a.php")].Mode)
+	}
+	if baseline[filepath.Join(root, "b.php")].Mode != 0o600 {
+		t.Fatalf("b.php mode = %04o, want 0600", baseline[filepath.Join(root, "b.php")].Mode)
+	}
+	// Digest baseline harus stabil melewati satu siklus perbandingan
+	// (tidak ada adopsi mode yang mengubahnya).
+	digest1, count1, err := l.BaselineDigest()
+	if err != nil {
+		t.Fatalf("BaselineDigest: %v", err)
+	}
+	results, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	res := scanner.CompareWithBaseline(results, baseline, 2, nil)
+	if len(res.ModeAdoptions) != 0 {
+		t.Fatalf("fresh rebuild must not need mode adoption, got %v", res.ModeAdoptions)
+	}
+	if err := l.AdoptBaselineModes(res.ModeAdoptions); err != nil {
+		t.Fatalf("AdoptBaselineModes: %v", err)
+	}
+	digest2, count2, err := l.BaselineDigest()
+	if err != nil {
+		t.Fatalf("BaselineDigest: %v", err)
+	}
+	if digest1 != digest2 || count1 != count2 {
+		t.Fatalf("digest changed after one cycle: %s/%d -> %s/%d", digest1, count1, digest2, count2)
+	}
+	// Dan VerifyBaselineDigest pada blok baseline yang baru dicatat harus
+	// cocok.
+	if _, err := l.AppendBlock(models.AnomalyEvent{FilePath: "[admin]", Action: models.ActionBaselineInit, Actor: "test", Detail: "test", BaselineDigest: digest1, BaselineCount: count1}); err != nil {
+		t.Fatalf("AppendBlock: %v", err)
+	}
+	vb, err := l.VerifyBaselineDigest()
+	if err != nil {
+		t.Fatalf("VerifyBaselineDigest: %v", err)
+	}
+	if !vb.Match {
+		t.Fatalf("VerifyBaselineDigest = %+v, want match", vb)
 	}
 }

@@ -287,6 +287,10 @@ func formatCaption(label, filename string, exp *ledger.LedgerExport) string {
 	if headHash == "" {
 		headHash = "(belum ada blok)"
 	}
+	headBlockID := strings.TrimSpace(exp.HeadBlockID)
+	if headBlockID == "" {
+		headBlockID = "(belum ada blok)"
+	}
 
 	return fmt.Sprintf(
 		"FIM-IPL: BACKUP LEDGER\n\n"+
@@ -294,11 +298,12 @@ func formatCaption(label, filename string, exp *ledger.LedgerExport) string {
 			"Waktu       : %s\n"+
 			"Total blok  : %d\n"+
 			"Verifikasi  : %s\n"+
+			"Block terakhir : %s\n"+
 			"Head hash   : %s\n"+
 			"File        : %s\n\n"+
 			"Simpan head hash ini di luar server untuk mendeteksi penghapusan blok terakhir.",
 		label, exp.GeneratedAt.Format("2006-01-02 15:04:05 UTC"),
-		exp.TotalBlocks, verifyLabel(exp.Verify.Valid), headHash, filename,
+		exp.TotalBlocks, verifyLabel(exp.Verify.Valid), headBlockID, headHash, filename,
 	)
 }
 

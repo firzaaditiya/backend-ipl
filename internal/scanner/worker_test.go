@@ -25,7 +25,7 @@ func TestCompareWithBaselineDetectsAllActions(t *testing.T) {
 		sr("/w/created.php", "fresh"),
 	}
 
-	res := CompareWithBaseline(results, baseline, 4)
+	res := CompareWithBaseline(results, baseline, 4, nil)
 
 	if len(res.Modified) != 1 || res.Modified[0].FilePath != "/w/modified.php" {
 		t.Fatalf("expected 1 modified file, got %+v", res.Modified)
@@ -49,7 +49,7 @@ func TestCompareWithBaselineIgnoresMtimeOnlyChange(t *testing.T) {
 	result := sr("/w/a.php", "hash")
 	result.ModTime = time.Now()
 
-	res := CompareWithBaseline([]models.ScanResult{result}, baseline, 4)
+	res := CompareWithBaseline([]models.ScanResult{result}, baseline, 4, nil)
 	if res.TotalAnomalies() != 0 {
 		t.Fatalf("expected no anomalies for hash-equal file, got %d", res.TotalAnomalies())
 	}
@@ -64,7 +64,7 @@ func TestCompareWithBaselineIsDeterministic(t *testing.T) {
 		sr("/w/m.php", "1"),
 	}
 
-	res := CompareWithBaseline(results, baseline, 4)
+	res := CompareWithBaseline(results, baseline, 4, nil)
 	if len(res.Created) != 3 {
 		t.Fatalf("expected 3 created, got %d", len(res.Created))
 	}
@@ -85,7 +85,7 @@ func TestCompareUnreadableIsNotDeleted(t *testing.T) {
 		{Path: "/w/secret.php", Err: os.ErrPermission},
 	}
 
-	res := CompareWithBaseline(results, baseline, 4)
+	res := CompareWithBaseline(results, baseline, 4, nil)
 
 	if len(res.Deleted) != 0 {
 		t.Fatalf("file tidak terbaca tidak boleh dianggap DELETED: %+v", res.Deleted)
@@ -104,7 +104,7 @@ func TestCompareUnreadableNewFileIsReported(t *testing.T) {
 		{Path: "/w/backdoor.php", Err: os.ErrPermission},
 	}
 
-	res := CompareWithBaseline(results, map[string]models.FileRecord{}, 4)
+	res := CompareWithBaseline(results, map[string]models.FileRecord{}, 4, nil)
 
 	if len(res.Created) != 0 || len(res.Deleted) != 0 {
 		t.Fatalf("unreadable baru tidak boleh menjadi CREATED/DELETED: %+v", res)
@@ -127,7 +127,7 @@ func TestCompareOversizeFileIsNeitherDeletedNorUnreadable(t *testing.T) {
 		{Path: "/w/big.mp4", Err: ErrFileOversize},
 	}
 
-	res := CompareWithBaseline(results, baseline, 2)
+	res := CompareWithBaseline(results, baseline, 2, nil)
 
 	if res.TotalAnomalies() != 0 {
 		t.Fatalf("expected 0 anomalies for oversize file, got %+v", res)
@@ -139,7 +139,7 @@ func TestCompareOversizeNewFileIsNotReported(t *testing.T) {
 		{Path: "/w/new-big.mp4", Err: ErrFileOversize},
 	}
 
-	res := CompareWithBaseline(results, map[string]models.FileRecord{}, 1)
+	res := CompareWithBaseline(results, map[string]models.FileRecord{}, 1, nil)
 
 	if res.TotalAnomalies() != 0 {
 		t.Fatalf("expected 0 anomalies for new oversize file, got %+v", res)
@@ -155,7 +155,7 @@ func TestCompareWithBaselineRespectsWorkerCount(t *testing.T) {
 		results = append(results, models.ScanResult{Path: p, Hash: "h"})
 	}
 	// Satu worker pun harus menghasilkan hasil yang sama (deterministik).
-	res := CompareWithBaseline(results, baseline, 1)
+	res := CompareWithBaseline(results, baseline, 1, nil)
 	if res.TotalAnomalies() != 0 {
 		t.Fatalf("expected 0 anomalies with 1 worker, got %+v", res)
 	}
@@ -168,7 +168,7 @@ func TestCompareModeOnlyChangeIsModeChanged(t *testing.T) {
 	scanned := sr("/w/wp-config.php", "h")
 	scanned.Mode = 0o777
 
-	res := CompareWithBaseline([]models.ScanResult{scanned}, baseline, 2)
+	res := CompareWithBaseline([]models.ScanResult{scanned}, baseline, 2, nil)
 
 	if len(res.ModeChanged) != 1 {
 		t.Fatalf("expected 1 mode-changed, got %+v", res)
@@ -197,7 +197,7 @@ func TestCompareModeAdoptionForLegacyBaseline(t *testing.T) {
 	scanned := sr("/w/legacy.php", "h")
 	scanned.Mode = 0o644
 
-	res := CompareWithBaseline([]models.ScanResult{scanned}, baseline, 2)
+	res := CompareWithBaseline([]models.ScanResult{scanned}, baseline, 2, nil)
 
 	if res.TotalAnomalies() != 0 {
 		t.Fatalf("legacy baseline must not produce an event on first cycle: %+v", res)
@@ -214,7 +214,7 @@ func TestCompareModeChangePlusHashChangeIsModified(t *testing.T) {
 	scanned := sr("/w/a.php", "new")
 	scanned.Mode = 0o600
 
-	res := CompareWithBaseline([]models.ScanResult{scanned}, baseline, 2)
+	res := CompareWithBaseline([]models.ScanResult{scanned}, baseline, 2, nil)
 
 	if len(res.Modified) != 1 || len(res.ModeChanged) != 0 {
 		t.Fatalf("hash+mode change must be a single MODIFIED: %+v", res)
@@ -232,7 +232,7 @@ func TestCompareSkippedOversizeIsCounted(t *testing.T) {
 		{Path: "/w/big.mp4", Mode: 0o644, Err: ErrFileOversize},
 	}
 
-	res := CompareWithBaseline(results, baseline, 2)
+	res := CompareWithBaseline(results, baseline, 2, nil)
 
 	if res.SkippedOversize != 1 {
 		t.Fatalf("expected 1 skipped oversize, got %d", res.SkippedOversize)

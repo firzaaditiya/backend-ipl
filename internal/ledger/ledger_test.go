@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -464,5 +465,543 @@ func TestAppendBlockRecordsModes(t *testing.T) {
 	}
 	if res := l.VerifyChain(); !res.Valid {
 		t.Fatalf("chain must stay valid with mode fields: %s", res.Message)
+	}
+}
+
+func TestAppendBlockUsesHashVersion3(t *testing.T) {
+	l := newTestLedger(t)
+
+	block, err := l.AppendBlock(event("/var/www/x.php", models.ActionCreated, "", "hash", true))
+	if err != nil {
+		t.Fatalf("AppendBlock: %v", err)
+	}
+	if block.HashVersion != 3 {
+		t.Fatalf("HashVersion = %d, want 3", block.HashVersion)
+	}
+	res := l.VerifyChain()
+	if !res.Valid {
+		t.Fatalf("expected valid chain, got: %s (block %s)", res.Message, res.FailedBlock)
+	}
+}
+
+// putV1Block menulis satu blok v1 (HashVersion 0, hash dihitung dengan
+// formula lama) langsung ke bucket, lalu memajukan sequence agar
+// AppendBlock berikutnya tidak menimpanya.
+func putV1Block(t *testing.T, l *Ledger, block models.Block) {
+	t.Helper()
+	block.HashVersion = 0
+	block.BlockHash = calculateBlockHashV1(block)
+	data, err := json.Marshal(block)
+	if err != nil {
+		t.Fatalf("marshal v1 block: %v", err)
+	}
+	if err := l.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketBlocks)
+		if err := b.Put([]byte("000000000001"), data); err != nil {
+			return err
+		}
+		return b.SetSequence(1)
+	}); err != nil {
+		t.Fatalf("put v1 block: %v", err)
+	}
+}
+
+func TestMixedV1V2V3ChainVerifies(t *testing.T) {
+	l := newTestLedger(t)
+
+	// Blok pertama ditulis dengan formula v1 (seperti 29 blok produksi).
+	putV1Block(t, l, models.Block{
+		ID:            "BLK-000001",
+		Timestamp:     time.Date(2026, 11, 5, 17, 2, 48, 0, time.UTC),
+		FilePath:      "/var/www/html/fim-sim-v15.php",
+		Action:        models.ActionCreated,
+		NewHash:       "9de72836",
+		NewMode:       0o644,
+		Quarantined:   true,
+		PrevBlockHash: "0000000000000000000000000000000000000000000000000000000000000000",
+	})
+
+	// Blok kedua ditulis dengan formula v2 (seperti blok instance uji T-02/T-03).
+	putV2Block(t, l, models.Block{
+		ID:            "BLK-000002",
+		Timestamp:     time.Date(2026, 11, 5, 22, 34, 40, 0, time.UTC),
+		FilePath:      "/var/www/html/fim-sim-v15.php",
+		Action:        models.ActionModified,
+		OldHash:       "9de72836",
+		NewHash:       "7eb1dba8",
+		OldMode:       0o644,
+		NewMode:       0o644,
+		Quarantined:   true,
+		PrevBlockHash: "0000000000000000000000000000000000000000000000000000000000000000",
+	})
+
+	// Blok berikutnya dibuat AppendBlock biasa (v3) di atas rantai v1→v2.
+	if _, err := l.AppendBlock(event("/var/www/html/fim-sim-v15.php", models.ActionDeleted, "7eb1dba8", "", false)); err != nil {
+		t.Fatalf("AppendBlock v3: %v", err)
+	}
+
+	res := l.VerifyChain()
+	if !res.Valid {
+		t.Fatalf("expected mixed v1->v2->v3 chain to verify, got: %s (block %s)", res.Message, res.FailedBlock)
+	}
+	if res.TotalBlocks != 3 {
+		t.Fatalf("expected 3 blocks, got %d", res.TotalBlocks)
+	}
+	if res.HeadBlockID != "BLK-000003" {
+		t.Fatalf("head = %s, want BLK-000003", res.HeadBlockID)
+	}
+}
+
+// putV2Block menulis satu blok v2 (HashVersion 2, hash dihitung dengan
+// formula v2) langsung ke bucket, lalu memajukan sequence. PrevBlockHash
+// dihitung ulang dari blok sebelumnya agar rantai tetap utuh.
+func putV2Block(t *testing.T, l *Ledger, block models.Block) {
+	t.Helper()
+	// Prev harus menunjuk hash blok sebelumnya (BLK-000001 v1).
+	blocks, _, err := l.GetBlocks(0, 1)
+	if err != nil || len(blocks) != 1 {
+		t.Fatalf("get prev block: %v (blocks=%d)", err, len(blocks))
+	}
+	block.PrevBlockHash = blocks[0].BlockHash
+	block.HashVersion = 2
+	block.BlockHash = calculateBlockHashV2(block)
+	data, err := json.Marshal(block)
+	if err != nil {
+		t.Fatalf("marshal v2 block: %v", err)
+	}
+	if err := l.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketBlocks)
+		if err := b.Put([]byte("000000000002"), data); err != nil {
+			return err
+		}
+		return b.SetSequence(2)
+	}); err != nil {
+		t.Fatalf("put v2 block: %v", err)
+	}
+}
+
+func TestV3TamperFailsAtExactBlock(t *testing.T) {
+	tamper := func(t *testing.T, l *Ledger, blockID string, mutate func(*models.Block)) {
+		t.Helper()
+		if err := l.db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket(bucketBlocks)
+			c := b.Cursor()
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				var block models.Block
+				if err := json.Unmarshal(v, &block); err != nil {
+					return err
+				}
+				if block.ID != blockID {
+					continue
+				}
+				mutate(&block)
+				data, err := json.Marshal(block)
+				if err != nil {
+					return err
+				}
+				return b.Put(k, data)
+			}
+			return fmt.Errorf("block %s not found", blockID)
+		}); err != nil {
+			t.Fatalf("tamper: %v", err)
+		}
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*models.Block)
+	}{
+		{"OldMode", func(b *models.Block) { b.OldMode = 0o777 }},
+		{"NewMode", func(b *models.Block) { b.NewMode = 0o600 }},
+		{"QuarantineErr", func(b *models.Block) { b.QuarantineErr = "permission denied" }},
+		{"Actor", func(b *models.Block) { b.Actor = "auditor (Auditor) dari 10.0.0.1" }},
+		{"Detail", func(b *models.Block) { b.Detail = "alasan palsu" }},
+		{"BaselineDigest", func(b *models.Block) {
+			b.BaselineDigest = "0000000000000000000000000000000000000000000000000000000000000000"
+		}},
+		{"BaselineCount", func(b *models.Block) { b.BaselineCount = 9999 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newTestLedger(t)
+			for i := 0; i < 3; i++ {
+				ev := event("/var/www/x.php", models.ActionModeChanged, "same", "same", true)
+				ev.OldMode = 0o644
+				ev.NewMode = 0o777
+				ev.Actor = "admin (Super Admin) dari 127.0.0.1"
+				ev.Detail = "pelepasan karantina: berkas dipastikan aman"
+				if _, err := l.AppendBlock(ev); err != nil {
+					t.Fatalf("AppendBlock %d: %v", i, err)
+				}
+			}
+			tamper(t, l, "BLK-000002", tc.mutate)
+			res := l.VerifyChain()
+			if res.Valid {
+				t.Fatalf("expected tampered %s to fail verification", tc.name)
+			}
+			if res.FailedBlock != "BLK-000002" {
+				t.Fatalf("FailedBlock = %q, want BLK-000002", res.FailedBlock)
+			}
+		})
+	}
+}
+
+func TestUnknownHashVersionRejected(t *testing.T) {
+	l := newTestLedger(t)
+	if _, err := l.AppendBlock(event("/var/www/x.php", models.ActionCreated, "", "hash", true)); err != nil {
+		t.Fatalf("AppendBlock: %v", err)
+	}
+	if err := l.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketBlocks)
+		k, v := b.Cursor().First()
+		var block models.Block
+		if err := json.Unmarshal(v, &block); err != nil {
+			return err
+		}
+		block.HashVersion = 99
+		data, _ := json.Marshal(block)
+		return b.Put(k, data)
+	}); err != nil {
+		t.Fatalf("tamper version: %v", err)
+	}
+	res := l.VerifyChain()
+	if res.Valid {
+		t.Fatal("expected unknown hash_version to fail verification")
+	}
+	if res.FailedBlock != "BLK-000001" {
+		t.Fatalf("FailedBlock = %q, want BLK-000001", res.FailedBlock)
+	}
+}
+
+func TestPipeForgeryCannotCollide(t *testing.T) {
+	ts := time.Date(2026, 11, 5, 22, 30, 0, 0, time.UTC)
+	base := models.Block{
+		ID:            "BLK-000001",
+		Timestamp:     ts,
+		OldHash:       "",
+		NewHash:       "abc",
+		PrevBlockHash: "0000000000000000000000000000000000000000000000000000000000000000",
+		Quarantined:   true,
+	}
+	// Dua tuple field berbeda yang string gabungan v1-nya identik:
+	// "/var/www/a|b.php" + "|" + "CREATED" == "/var/www/a" + "|" + "b.php|CREATED".
+	a := base
+	a.FilePath = "/var/www/a|b.php"
+	a.Action = models.ActionCreated
+	b := base
+	b.FilePath = "/var/www/a"
+	b.Action = "b.php|" + models.ActionCreated
+
+	if calculateBlockHashV1(a) != calculateBlockHashV1(b) {
+		t.Fatal("v1 hash seharusnya bertabrakan untuk pasangan ini (itulah celahnya)")
+	}
+	a.HashVersion, b.HashVersion = 2, 2
+	if calculateBlockHashV2(a) == calculateBlockHashV2(b) {
+		t.Fatal("v2 hash tidak boleh bertabrakan untuk pasangan ini")
+	}
+}
+
+func TestBaselineDigestIsStableAndSensitive(t *testing.T) {
+	records := map[string]models.FileRecord{
+		"/var/www/a.php": {Path: "/var/www/a.php", Hash: "aaa", Mode: 0o644, Size: 100},
+		"/var/www/b.php": {Path: "/var/www/b.php", Hash: "bbb", Mode: 0o600, Size: 200},
+	}
+	d1, n1 := baselineDigestFor(records)
+	if n1 != 2 {
+		t.Fatalf("count = %d, want 2", n1)
+	}
+	// Urutan map tidak memengaruhi digest (diurutkan berdasarkan path).
+	d2, _ := baselineDigestFor(records)
+	if d1 != d2 {
+		t.Fatal("digest must be deterministic")
+	}
+	changed := map[string]models.FileRecord{
+		"/var/www/a.php": {Path: "/var/www/a.php", Hash: "aaa", Mode: 0o644, Size: 100},
+		"/var/www/b.php": {Path: "/var/www/b.php", Hash: "ccc", Mode: 0o600, Size: 200},
+	}
+	if d, _ := baselineDigestFor(changed); d == d1 {
+		t.Fatal("changing one hash must change the digest")
+	}
+	changedMode := map[string]models.FileRecord{
+		"/var/www/a.php": {Path: "/var/www/a.php", Hash: "aaa", Mode: 0o644, Size: 100},
+		"/var/www/b.php": {Path: "/var/www/b.php", Hash: "bbb", Mode: 0o644, Size: 200},
+	}
+	if d, _ := baselineDigestFor(changedMode); d == d1 {
+		t.Fatal("changing one mode must change the digest")
+	}
+	changedSize := map[string]models.FileRecord{
+		"/var/www/a.php": {Path: "/var/www/a.php", Hash: "aaa", Mode: 0o644, Size: 101},
+		"/var/www/b.php": {Path: "/var/www/b.php", Hash: "bbb", Mode: 0o600, Size: 200},
+	}
+	if d, _ := baselineDigestFor(changedSize); d == d1 {
+		t.Fatal("changing one size must change the digest")
+	}
+	// Baseline kosong punya digest yang terdefinisi (hash dari string kosong).
+	dEmpty, nEmpty := baselineDigestFor(nil)
+	if nEmpty != 0 || dEmpty == "" {
+		t.Fatalf("empty baseline: digest=%q count=%d", dEmpty, nEmpty)
+	}
+}
+
+func TestVerifyBaselineDigestDetectsDirectEdit(t *testing.T) {
+	l := newTestLedger(t)
+
+	records := []models.FileRecord{
+		{Path: "/var/www/a.php", Hash: "aaa", Mode: 0o644, Size: 100, ModTime: time.Now(), ScannedAt: time.Now()},
+		{Path: "/var/www/b.php", Hash: "bbb", Mode: 0o600, Size: 200, ModTime: time.Now(), ScannedAt: time.Now()},
+	}
+	if err := l.SaveBaseline(records); err != nil {
+		t.Fatalf("SaveBaseline: %v", err)
+	}
+	digest, count, err := l.BaselineDigest()
+	if err != nil {
+		t.Fatalf("BaselineDigest: %v", err)
+	}
+	initBlock, err := l.AppendBlock(models.AnomalyEvent{
+		FilePath:       models.AdminBlockPath,
+		Action:         models.ActionBaselineInit,
+		Actor:          "admin (Super Admin) dari 127.0.0.1",
+		Detail:         "baseline dibuat: 2 berkas",
+		BaselineDigest: digest,
+		BaselineCount:  count,
+	})
+	if err != nil {
+		t.Fatalf("AppendBlock: %v", err)
+	}
+	if initBlock.HashVersion != 3 {
+		t.Fatalf("HashVersion = %d, want 3", initBlock.HashVersion)
+	}
+	if initBlock.BaselineDigest != digest || initBlock.BaselineCount != 2 {
+		t.Fatalf("block digest = %q/%d, want %q/2", initBlock.BaselineDigest, initBlock.BaselineCount, digest)
+	}
+
+	// Baseline belum diubah: verifikasi cocok.
+	res, err := l.VerifyBaselineDigest()
+	if err != nil {
+		t.Fatalf("VerifyBaselineDigest: %v", err)
+	}
+	if !res.Match {
+		t.Fatalf("expected match, got: %s", res.Message)
+	}
+	if res.BlockID != initBlock.ID {
+		t.Fatalf("BlockID = %q, want %q", res.BlockID, initBlock.ID)
+	}
+
+	// Edit SATU entri baseline langsung di Bbolt (simulasi root yang
+	// memanipulasi baseline tanpa lewat endpoint resmi).
+	if err := l.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketBaseline)
+		v := b.Get([]byte("/var/www/b.php"))
+		var rec models.FileRecord
+		if err := json.Unmarshal(v, &rec); err != nil {
+			return err
+		}
+		rec.Hash = "hash-palsu"
+		data, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("/var/www/b.php"), data)
+	}); err != nil {
+		t.Fatalf("tamper baseline: %v", err)
+	}
+
+	res, err = l.VerifyBaselineDigest()
+	if err != nil {
+		t.Fatalf("VerifyBaselineDigest: %v", err)
+	}
+	if res.Match {
+		t.Fatal("expected mismatch after a direct baseline edit")
+	}
+	if res.BlockID != initBlock.ID {
+		t.Fatalf("BlockID = %q, want %q", res.BlockID, initBlock.ID)
+	}
+	if res.ExpectedDigest == res.ActualDigest {
+		t.Fatal("expected different digests after tampering")
+	}
+	if res.ExpectedCount != 2 || res.ActualCount != 2 {
+		t.Fatalf("counts = %d/%d, want 2/2", res.ExpectedCount, res.ActualCount)
+	}
+	// Rantai sendiri tetap valid: yang rusak adalah baseline, bukan blok.
+	if vres := l.VerifyChain(); !vres.Valid {
+		t.Fatalf("chain must stay valid (baseline tampering is outside the chain): %s", vres.Message)
+	}
+}
+
+func TestGetQuarantineModePrefersChain(t *testing.T) {
+	l := newTestLedger(t)
+	path := "/var/www/shell.php"
+
+	if _, err := l.AppendBlock(models.AnomalyEvent{
+		FilePath:    path,
+		Action:      models.ActionCreated,
+		NewHash:     "abc",
+		NewMode:     0o644,
+		Quarantined: true,
+	}); err != nil {
+		t.Fatalf("AppendBlock: %v", err)
+	}
+
+	// Bucket diisi nilai yang SALAH (simulasi manipulasi langsung).
+	if err := l.RecordQuarantineMode(path, 0o600); err != nil {
+		t.Fatalf("RecordQuarantineMode: %v", err)
+	}
+
+	mode, found, err := l.GetQuarantineMode(path)
+	if err != nil {
+		t.Fatalf("GetQuarantineMode: %v", err)
+	}
+	if !found {
+		t.Fatal("expected mode to be found")
+	}
+	if mode != 0o644 {
+		t.Fatalf("mode = %04o, want 0644 (chain must win over the tampered bucket)", mode)
+	}
+
+	// Fallback: path yang hanya ada di bucket (tanpa blok rantai).
+	other := "/var/www/lama.php"
+	if err := l.RecordQuarantineMode(other, 0o640); err != nil {
+		t.Fatalf("RecordQuarantineMode: %v", err)
+	}
+	mode, found, err = l.GetQuarantineMode(other)
+	if err != nil || !found || mode != 0o640 {
+		t.Fatalf("bucket fallback: mode=%04o found=%v err=%v", mode, found, err)
+	}
+}
+
+func TestVerifyBlocksMixedChain(t *testing.T) {
+	l := newTestLedger(t)
+
+	// Rantai campuran v1 -> v2 -> v3 (dibangun lewat AppendBlock; versi
+	// blok ditentukan kode AppendBlock saat ini, jadi jalankan dengan
+	// helper putV1Block/putV2Block untuk blok lamanya).
+	putV1Block(t, l, models.Block{
+		ID:            "BLK-000001",
+		Timestamp:     time.Date(2026, 11, 5, 17, 2, 48, 0, time.UTC),
+		FilePath:      "/var/www/a.php",
+		Action:        models.ActionCreated,
+		NewHash:       "aaa",
+		NewMode:       0o644,
+		Quarantined:   true,
+		PrevBlockHash: "0000000000000000000000000000000000000000000000000000000000000000",
+	})
+	putV2Block(t, l, models.Block{
+		ID:            "BLK-000002",
+		Timestamp:     time.Date(2026, 11, 5, 22, 34, 40, 0, time.UTC),
+		FilePath:      "/var/www/b.php",
+		Action:        models.ActionCreated,
+		NewHash:       "bbb",
+		NewMode:       0o644,
+		Quarantined:   true,
+		PrevBlockHash: "0000000000000000000000000000000000000000000000000000000000000000",
+	})
+	if _, err := l.AppendBlock(event("/var/www/c.php", models.ActionCreated, "", "ccc", false)); err != nil {
+		t.Fatalf("AppendBlock: %v", err)
+	}
+
+	blocks, _, err := l.GetBlocks(0, 100)
+	if err != nil {
+		t.Fatalf("GetBlocks: %v", err)
+	}
+	// GetBlocks mengembalikan urutan terbaru-dulu; balik untuk VerifyBlocks.
+	for i, j := 0, len(blocks)-1; i < j; i, j = i+1, j-1 {
+		blocks[i], blocks[j] = blocks[j], blocks[i]
+	}
+
+	res := VerifyBlocks(blocks)
+	if !res.Valid {
+		t.Fatalf("VerifyBlocks mixed chain = invalid: %s", res.Message)
+	}
+	if res.TotalBlocks != 3 || res.HeadBlockID != "BLK-000003" {
+		t.Fatalf("VerifyBlocks = %+v, want 3 blocks head BLK-000003", res)
+	}
+}
+
+func TestVerifyBlocksDetectsTampering(t *testing.T) {
+	l := newTestLedger(t)
+	for i := 0; i < 3; i++ {
+		if _, err := l.AppendBlock(event("/var/www/x.php", models.ActionCreated, "", "hash", false)); err != nil {
+			t.Fatalf("AppendBlock: %v", err)
+		}
+	}
+	blocks, _, err := l.GetBlocks(0, 100)
+	if err != nil {
+		t.Fatalf("GetBlocks: %v", err)
+	}
+	for i, j := 0, len(blocks)-1; i < j; i, j = i+1, j-1 {
+		blocks[i], blocks[j] = blocks[j], blocks[i]
+	}
+
+	blocks[1].NewHash = "hash-palsu"
+	res := VerifyBlocks(blocks)
+	if res.Valid {
+		t.Fatal("VerifyBlocks must fail on a tampered block")
+	}
+	if res.FailedBlock != "BLK-000002" {
+		t.Fatalf("FailedBlock = %q, want BLK-000002", res.FailedBlock)
+	}
+}
+
+func TestVerifyBlocksCannotDetectTailTruncation(t *testing.T) {
+	// BATAS YANG JUJUR (T-06): menghapus blok-blok terakhir menghasilkan
+	// rantai yang lebih pendek tetapi tetap utuh — verifikasi lokal
+	// TIDAK bisa mendeteksinya. Test ini mengunci perilaku itu agar
+	// tidak ada yang mengklaim sebaliknya; yang mendeteksi pemotongan
+	// adalah perbandingan head hash dengan jangkar eksternal (Telegram).
+	l := newTestLedger(t)
+	for i := 0; i < 4; i++ {
+		if _, err := l.AppendBlock(event("/var/www/x.php", models.ActionCreated, "", "hash", false)); err != nil {
+			t.Fatalf("AppendBlock: %v", err)
+		}
+	}
+	blocks, _, err := l.GetBlocks(0, 100)
+	if err != nil {
+		t.Fatalf("GetBlocks: %v", err)
+	}
+	for i, j := 0, len(blocks)-1; i < j; i, j = i+1, j-1 {
+		blocks[i], blocks[j] = blocks[j], blocks[i]
+	}
+
+	truncated := blocks[:2]
+	res := VerifyBlocks(truncated)
+	if !res.Valid {
+		t.Fatalf("truncated chain must still verify (this is the known limit): %s", res.Message)
+	}
+	if res.HeadBlockID != "BLK-000002" {
+		t.Fatalf("truncated head = %q, want BLK-000002", res.HeadBlockID)
+	}
+	// Jangkar eksternal (head hash dari sebelum pemotongan) TIDAK cocok
+	// dengan head hash rantai yang terpotong — itulah deteksinya.
+	full := VerifyBlocks(blocks)
+	if full.HeadHash == res.HeadHash {
+		t.Fatal("truncated head hash must differ from the full-chain anchor")
+	}
+}
+
+func TestRecordVerificationRoundTrip(t *testing.T) {
+	l := newTestLedger(t)
+	if got, err := l.GetLastVerification(); err != nil || got != nil {
+		t.Fatalf("GetLastVerification before any record = %v, %v; want nil, nil", got, err)
+	}
+	lv := models.LastVerification{
+		VerifiedAt:      time.Now().UTC().Truncate(time.Second),
+		ChainValid:      true,
+		ChainMessage:    "chain intact",
+		HeadBlockID:     "BLK-000005",
+		HeadHash:        strings.Repeat("c", 64),
+		TotalBlocks:     5,
+		BaselineMatch:   true,
+		BaselineBlockID: "BLK-000004",
+		BaselineMessage: "baseline cocok dengan blok baseline terakhir",
+	}
+	if err := l.RecordVerification(lv); err != nil {
+		t.Fatalf("RecordVerification: %v", err)
+	}
+	got, err := l.GetLastVerification()
+	if err != nil {
+		t.Fatalf("GetLastVerification: %v", err)
+	}
+	if got == nil || got.HeadBlockID != "BLK-000005" || !got.ChainValid || !got.BaselineMatch {
+		t.Fatalf("GetLastVerification = %+v", got)
 	}
 }

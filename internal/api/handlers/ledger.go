@@ -83,6 +83,26 @@ func (h *LedgerHandler) VerifyChain(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(res)
 }
 
+// VerifyBaseline membandingkan digest baseline saat ini dengan digest
+// pada blok baseline terakhir (T-04, v1.6.0). Read-only (Auditor boleh):
+// operator dapat memeriksa apakah ada entri baseline yang berubah di
+// luar jalur resmi tanpa menunggu verifikasi terjadwal (T-06).
+func (h *LedgerHandler) VerifyBaseline(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	res, err := h.ledger.VerifyBaselineDigest()
+	if err != nil {
+		http.Error(w, `{"error":"failed to verify baseline"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
+}
+
 // ExportLedger mengirim seluruh isi ledger dalam bentuk JSON (attachment).
 // Cocok untuk arsip / audit / laporan skripsi.
 func (h *LedgerHandler) ExportLedger(w http.ResponseWriter, r *http.Request) {

@@ -25,23 +25,44 @@ type CompareResult struct {
 	// SkippedOversize menghitung file non-kode >50 MB yang dilewati pada
 	// siklus ini (isinya tidak diperiksa).
 	SkippedOversize int
+	// ExcludedFiles menghitung berkas yang dikecualikan dari deteksi pada
+	// siklus ini (exclude_globs atau kebijakan uploads, T-05). Berkas ini
+	// tetap masuk baseline — yang tidak terjadi hanyalah event dan
+	// karantina — sehingga angkanya harus terlihat di metrik dan dasbor
+	// agar pengecualian tidak menjadi blind spot diam-diam.
+	ExcludedFiles int
+	// Excluded adalah daftar path yang dikecualikan pada siklus ini
+	// (terurut, deterministik). Caller memakainya untuk memasukkan berkas
+	// tersebut ke baseline tanpa event, agar baseline tetap mencerminkan
+	// keadaan disk dan tercakup digest (lihat main.go).
+	Excluded []string
 }
 
 // CompareWithBaseline membandingkan hasil scan dengan baseline. workers
 // adalah jumlah goroutine pembanding (<= 0 berarti default 4); nilai ini
 // berasal dari konfigurasi scanner agar konsisten dengan worker hashing.
+// exclusions (nil = tidak ada) adalah aturan pengecualian T-05: path yang
+// dikecualikan tidak menghasilkan event apa pun, tetapi tetap dihitung di
+// ExcludedFiles dan modenya tetap diadopsi bila baseline lama belum
+// mencatatnya.
 //
 // Perbandingan memakai hash DAN mode (izin berkas). Perubahan mode saja —
 // mis. chmod 777 pada file konfigurasi — menghasilkan MODE_CHANGED; hash
 // yang sama dengan mode yang sama berarti tidak ada temuan. Baseline lama
 // yang belum mencatat mode (Mode == 0) tidak menghasilkan event pada
 // siklus pertama: modenya diadopsi diam-diam lewat ModeAdoptions.
-func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]models.FileRecord, workers int) *CompareResult {
+func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]models.FileRecord, workers int, exclusions *Exclusions) *CompareResult {
 	if workers <= 0 {
 		workers = 4
 	}
 	result := &CompareResult{ModeAdoptions: make(map[string]uint32)}
 	var mu sync.Mutex
+	excluded := make(map[string]struct{})
+	markExcluded := func(path string) {
+		mu.Lock()
+		excluded[path] = struct{}{}
+		mu.Unlock()
+	}
 
 	scannedMap := make(map[string]models.ScanResult, len(scanResults))
 	errorMap := make(map[string]models.ScanResult)
@@ -75,6 +96,21 @@ func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]mo
 						}
 					}()
 					scanned, exists := scannedMap[record.Path]
+					// Pengecualian (T-05): tidak ada event apa pun untuk
+					// path ini — tetapi hitung dan adopsi modenya bila
+					// baseline lama belum mencatatnya, agar baseline
+					// tetap lengkap.
+					if exclusions != nil && exclusions.IsExcluded(record.Path) {
+						markExcluded(record.Path)
+						if record.Mode == 0 {
+							if mode := modeObservedFor(record.Path, scanned, exists, skippedMap, errorMap); mode != 0 {
+								mu.Lock()
+								result.ModeAdoptions[record.Path] = mode
+								mu.Unlock()
+							}
+						}
+						return
+					}
 					if !exists {
 						if skipped, isSkipped := skippedMap[record.Path]; isSkipped {
 							// File ada tetapi tidak di-hash karena batas
@@ -160,6 +196,10 @@ func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]mo
 
 	for path, sr := range scannedMap {
 		if _, exists := baseline[path]; !exists {
+			if exclusions != nil && exclusions.IsExcluded(path) {
+				markExcluded(path)
+				continue
+			}
 			result.Created = append(result.Created, models.AnomalyEvent{
 				FilePath: path,
 				Action:   models.ActionCreated,
@@ -177,6 +217,10 @@ func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]mo
 		if _, exists := baseline[path]; exists {
 			continue
 		}
+		if exclusions != nil && exclusions.IsExcluded(path) {
+			markExcluded(path)
+			continue
+		}
 		result.Unreadable = append(result.Unreadable, models.AnomalyEvent{
 			FilePath: path,
 			Action:   models.ActionUnreadable,
@@ -186,6 +230,11 @@ func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]mo
 	}
 
 	result.SkippedOversize = len(skippedMap)
+	result.ExcludedFiles = len(excluded)
+	for path := range excluded {
+		result.Excluded = append(result.Excluded, path)
+	}
+	sort.Strings(result.Excluded)
 
 	// Urutkan secara deterministik: ledger dan laporan menjadi reprodusibel.
 	sort.Slice(result.Modified, func(i, j int) bool {
@@ -204,10 +253,26 @@ func CompareWithBaseline(scanResults []models.ScanResult, baseline map[string]mo
 		return result.Unreadable[i].FilePath < result.Unreadable[j].FilePath
 	})
 
-	log.Printf("[Scanner] Comparison done: %d modified, %d created, %d mode-changed, %d deleted, %d unreadable, %d skipped (oversize)",
-		len(result.Modified), len(result.Created), len(result.ModeChanged), len(result.Deleted), len(result.Unreadable), result.SkippedOversize)
+	log.Printf("[Scanner] Comparison done: %d modified, %d created, %d mode-changed, %d deleted, %d unreadable, %d skipped (oversize), %d excluded",
+		len(result.Modified), len(result.Created), len(result.ModeChanged), len(result.Deleted), len(result.Unreadable), result.SkippedOversize, result.ExcludedFiles)
 
 	return result
+}
+
+// modeObservedFor mengembalikan mode yang teramati untuk satu path dari
+// hasil scan (dipakai adopsi mode baseline lama pada path yang
+// dikecualikan — T-05). 0 berarti tidak ada mode yang teramati.
+func modeObservedFor(path string, scanned models.ScanResult, scannedOK bool, skippedMap, errorMap map[string]models.ScanResult) uint32 {
+	if scannedOK && scanned.Mode != 0 {
+		return scanned.Mode
+	}
+	if skipped, ok := skippedMap[path]; ok {
+		return skipped.Mode
+	}
+	if failed, ok := errorMap[path]; ok {
+		return failed.Mode
+	}
+	return 0
 }
 
 func (cr *CompareResult) TotalAnomalies() int {

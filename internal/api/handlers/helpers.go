@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -11,7 +12,10 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/skripsi/fim-ipl/internal/api/middleware"
+	"github.com/skripsi/fim-ipl/internal/config"
 	"github.com/skripsi/fim-ipl/internal/ledger"
 	"github.com/skripsi/fim-ipl/internal/models"
 	"github.com/skripsi/fim-ipl/internal/netguard"
@@ -50,8 +54,15 @@ func scanAndSaveBaseline(sc *scanner.Scanner, l *ledger.Ledger) (int, error) {
 			continue
 		}
 		records = append(records, models.FileRecord{
-			Path:      sr.Path,
-			Hash:      sr.Hash,
+			Path: sr.Path,
+			Hash: sr.Hash,
+			// Mode WAJIB dicatat (T-06): sebelum perbaikan ini, rebuild
+			// menulis Mode 0 untuk semua berkas. Siklus berikutnya lalu
+			// mengadopsi mode diam-diam (ModeAdoptions), sehingga digest
+			// baseline berubah tepat setelah rebuild dan verify-baseline
+			// selalu melaporkan mismatch sampai rebuild berikutnya —
+			// verifikasi terjadwal tidak pernah bisa menunjukkan "cocok".
+			Mode:      sr.Mode,
 			Size:      sr.Size,
 			ModTime:   sr.ModTime,
 			ScannedAt: now,
@@ -204,4 +215,100 @@ func publishState(hub *realtime.Hub, sc *scanner.Scanner, reason string) {
 		"is_monitoring":    sc.IsRunning(),
 		"maintenance_mode": sc.IsMaintenance(),
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Audit trail aksi administratif (T-03, v1.6.0)
+// ---------------------------------------------------------------------------
+
+// actorFromRequest membangun string pelaku dari klaim JWT di cookie sesi:
+// "username (Peran) dari IP". Peran ditulis dengan label tampilan agar
+// mudah dibaca di Audit Trail ("Super Admin", bukan "super_admin").
+// Bila klaim tidak bisa dibaca — tidak mungkin terjadi di endpoint
+// terproteksi karena router sudah memvalidasi token — dikembalikan
+// "(tidak dikenal)" agar blok tetap tercatat, bukan gagal.
+func actorFromRequest(r *http.Request, cfg *config.Config, l *ledger.Ledger) string {
+	if cfg == nil {
+		return "(tidak dikenal)"
+	}
+	snap := cfg.Snapshot()
+	claims, ok := middleware.ParseClaimsWithRevocation(r, snap.JWTSecret, snap.SessionEpoch, func(jti string) bool {
+		if l == nil {
+			return false
+		}
+		return l.IsTokenRevoked(jti)
+	})
+	if !ok {
+		return "(tidak dikenal)"
+	}
+	role := claims.Role
+	switch role {
+	case middleware.RoleSuperAdmin:
+		role = "Super Admin"
+	case middleware.RoleAuditor:
+		role = "Auditor"
+	}
+	return fmt.Sprintf("%s (%s) dari %s", claims.Username, role, middleware.ClientIP(r))
+}
+
+// appendAdminBlock mencatat satu aksi administratif ke ledger. Mengikuti
+// pola RELEASED: kegagalan pencatatan tidak membatalkan aksi (sudah
+// terjadi), tetapi dilaporkan lewat nilai kembalian agar handler bisa
+// menampilkannya di respons ("audited": false) dan mencatatnya di log.
+//
+// Actor diterima sebagai parameter, bukan dibaca dari request di sini:
+// handler WAJIB menghitungnya di awal (sebelum mutasi) lewat
+// actorFromRequest — tindakan yang menaikkan epoch sesi (mis. mengatur
+// auditor) membuat token pemanggil tidak valid lagi, sehingga actor yang
+// dibaca sesudah mutasi akan menjadi "(tidak dikenal)".
+func appendAdminBlock(l *ledger.Ledger, actor, action, detail string) bool {
+	return appendAdminBlockWithDigest(l, actor, action, detail, "", 0)
+}
+
+// appendAdminBlockWithDigest sama seperti appendAdminBlock, tetapi
+// menyertakan digest baseline (T-04) — dipakai blok BASELINE_INIT dan
+// BASELINE_UPDATE.
+func appendAdminBlockWithDigest(l *ledger.Ledger, actor, action, detail, digest string, count int) bool {
+	if l == nil {
+		return false
+	}
+	if _, err := l.AppendBlock(models.AnomalyEvent{
+		FilePath:       models.AdminBlockPath,
+		Action:         action,
+		Actor:          actor,
+		Detail:         detail,
+		BaselineDigest: digest,
+		BaselineCount:  count,
+	}); err != nil {
+		log.Printf("[Audit] Failed to record %s block: %v", action, err)
+		return false
+	}
+	return true
+}
+
+// maxReasonRunes adalah panjang maksimum alasan wajib (pelepasan karantina
+// dan baseline/update): cukup untuk satu kalimat yang jelas, dan alasan
+// tersimpan permanen di ledger sehingga tidak boleh membengkak.
+const maxReasonRunes = 500
+
+// parseReason membaca alasan wajib dari body JSON {"reason": "..."}.
+// Alasan 1–500 karakter setelah trim; kosong, terlalu panjang, atau body
+// yang tidak bisa dibaca ditolak.
+func parseReason(r *http.Request) (string, bool) {
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return "", false
+	}
+	return validateReason(req.Reason)
+}
+
+// validateReason memeriksa satu alasan: 1–500 karakter setelah trim.
+func validateReason(reason string) (string, bool) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" || utf8.RuneCountInString(reason) > maxReasonRunes {
+		return "", false
+	}
+	return reason, true
 }

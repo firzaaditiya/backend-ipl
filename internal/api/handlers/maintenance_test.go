@@ -46,7 +46,7 @@ func TestQuarantineReleaseIsAudited(t *testing.T) {
 	defer hub.Close()
 
 	h := NewQuarantineHandler(&config.Config{WatchPaths: []string{root}}, l, hub)
-	body, _ := json.Marshal(map[string]string{"file_path": path})
+	body, _ := json.Marshal(map[string]string{"file_path": path, "reason": "berkas dipastikan aman setelah diperiksa"})
 	rec := httptest.NewRecorder()
 	h.Release(rec, httptest.NewRequest(http.MethodPost, "/api/v1/quarantine/release", bytes.NewReader(body)))
 
@@ -104,7 +104,7 @@ func TestUpdateBaselineRefusesQuarantinedFiles(t *testing.T) {
 	hub := realtime.NewHub()
 	defer hub.Close()
 	sc := scanner.New(2, []string{root})
-	h := NewMaintenanceHandler(sc, l, hub)
+	h := NewMaintenanceHandler(&config.Config{}, sc, l, hub)
 
 	rec := httptest.NewRecorder()
 	h.UpdateBaseline(rec, httptest.NewRequest(http.MethodPost, "/api/v1/baseline/update", nil))
@@ -136,10 +136,11 @@ func TestUpdateBaselineSucceedsWithoutQuarantine(t *testing.T) {
 	hub := realtime.NewHub()
 	defer hub.Close()
 	sc := scanner.New(2, []string{root})
-	h := NewMaintenanceHandler(sc, l, hub)
+	h := NewMaintenanceHandler(&config.Config{}, sc, l, hub)
 
+	body, _ := json.Marshal(map[string]string{"reason": "update plugin WordPress"})
 	rec := httptest.NewRecorder()
-	h.UpdateBaseline(rec, httptest.NewRequest(http.MethodPost, "/api/v1/baseline/update", nil))
+	h.UpdateBaseline(rec, httptest.NewRequest(http.MethodPost, "/api/v1/baseline/update", bytes.NewReader(body)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -149,5 +150,13 @@ func TestUpdateBaselineSucceedsWithoutQuarantine(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("expected baseline with 1 file, got %d", count)
+	}
+	// Rebuild tercatat sebagai satu blok BASELINE_UPDATE dengan alasannya.
+	blocks, err := l.GetBlockCount()
+	if err != nil {
+		t.Fatalf("GetBlockCount: %v", err)
+	}
+	if blocks != 1 {
+		t.Fatalf("expected 1 audit block for the rebuild, got %d", blocks)
 	}
 }

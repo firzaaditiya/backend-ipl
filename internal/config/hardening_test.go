@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestCheckSecretsRejectsWeakWhenStrict(t *testing.T) {
@@ -119,5 +121,42 @@ func TestCheckLocalAPI(t *testing.T) {
 	}
 	if err := checkLocalAPI(&Config{ServerPort: ":8080"}); err == nil {
 		t.Fatal("API wildcard harus ditolak dalam mode local-only")
+	}
+}
+
+func TestCheckExternalSecretsAllowsAuditorBcryptHash(t *testing.T) {
+	// T-07: hash bcrypt auditor di config.json diizinkan — auditor dibuat
+	// saat runtime lewat API dan user daemon tidak bisa menulis fim.env;
+	// hash bukan kredensial yang bisa dipakai.
+	t.Setenv("FIM_REQUIRE_EXTERNAL_SECRETS", "1")
+	hash, err := bcrypt.GenerateFromPassword([]byte("auditor-password"), bcrypt.DefaultCost)
+	if err != nil {
+		t.Fatalf("bcrypt: %v", err)
+	}
+	c := &Config{
+		JWTSecret:       "env-secret",
+		AdminPassword:   "env-hash",
+		AuditorPassword: string(hash),
+		envOverrides: map[string]bool{
+			"jwt_secret": true, "admin_password": true,
+		},
+	}
+	if err := checkExternalSecrets(c); err != nil {
+		t.Fatalf("auditor bcrypt hash in config.json must be allowed: %v", err)
+	}
+}
+
+func TestCheckExternalSecretsRejectsPlaintextAuditorPassword(t *testing.T) {
+	t.Setenv("FIM_REQUIRE_EXTERNAL_SECRETS", "1")
+	c := &Config{
+		JWTSecret:       "env-secret",
+		AdminPassword:   "env-hash",
+		AuditorPassword: "plaintext-auditor",
+		envOverrides: map[string]bool{
+			"jwt_secret": true, "admin_password": true,
+		},
+	}
+	if err := checkExternalSecrets(c); err == nil {
+		t.Fatal("plaintext auditor password in config.json must be rejected")
 	}
 }

@@ -44,7 +44,7 @@ func NewRouter(
 	ledgerHandler := handlers.NewLedgerHandler(l)
 	settingsHandler := handlers.NewSettingsHandler(cfg, l, s, n, bm, hub)
 	metricsHandler := handlers.NewMetricsHandler(l)
-	maintHandler := handlers.NewMaintenanceHandler(s, l, hub)
+	maintHandler := handlers.NewMaintenanceHandler(cfg, s, l, hub)
 	quarantineHandler := handlers.NewQuarantineHandler(cfg, l, hub)
 	backupHandler := handlers.NewBackupHandler(bm)
 	systemHandler := handlers.NewSystemHandler(cfg, s)
@@ -186,6 +186,8 @@ func NewRouter(
 			ledgerHandler.GetBlocks(w, r)
 		case path == "/api/v1/ledger/verify":
 			ledgerHandler.VerifyChain(w, r)
+		case path == "/api/v1/ledger/verify-baseline":
+			ledgerHandler.VerifyBaseline(w, r)
 		case path == "/api/v1/ledger/export":
 			ledgerHandler.ExportLedger(w, r)
 

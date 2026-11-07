@@ -170,3 +170,65 @@ func TestPersistDoesNotWriteEnvSecrets(t *testing.T) {
 		t.Fatalf("non-env settings must still be persisted, got %v", disk["watch_paths"])
 	}
 }
+
+func TestInitFreshConfigSkipsSaveWhenEnvProvidesJWTSecret(t *testing.T) {
+	// Regresi T-07: boot pertama dengan FIM_JWT_SECRET dari env tidak
+	// boleh menulis secret acak ke disk.
+	t.Setenv("FIM_JWT_SECRET", "env-jwt-secret-yang-cukup-panjang-untuk-test")
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := DefaultConfig()
+	cfg.filePath = path
+	if err := initFreshConfig(cfg, path); err != nil {
+		t.Fatalf("initFreshConfig: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("config file must NOT be created when env provides the JWT secret (stat: %v)", err)
+	}
+	if cfg.JWTSecret != "env-jwt-secret-yang-cukup-panjang-untuk-test" {
+		t.Fatalf("JWTSecret = %q, want the env value", cfg.JWTSecret)
+	}
+}
+
+func TestInitFreshConfigSavesGeneratedSecretWhenEnvAbsent(t *testing.T) {
+	// Tanpa env: secret acak tetap dibuat DAN disimpan agar sesi stabil
+	// melewati restart.
+	t.Setenv("FIM_JWT_SECRET", "")
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := DefaultConfig()
+	cfg.filePath = path
+	if err := initFreshConfig(cfg, path); err != nil {
+		t.Fatalf("initFreshConfig: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("config file must be created: %v", err)
+	}
+	var saved struct {
+		JWTSecret string `json:"jwt_secret"`
+	}
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(saved.JWTSecret) < minJWTSecretLength {
+		t.Fatalf("saved jwt_secret too short: %q", saved.JWTSecret)
+	}
+	if cfg.JWTSecret != saved.JWTSecret {
+		t.Fatal("in-memory JWT secret must match the saved one")
+	}
+}
+
+func TestSnapshotMarksTelegramEnvSource(t *testing.T) {
+	t.Setenv("FIM_TELEGRAM_TOKEN", "env-token")
+	t.Setenv("FIM_TELEGRAM_CHAT_ID", "123")
+	cfg := DefaultConfig()
+	cfg.ApplyEnvOverrides()
+	snap := cfg.Snapshot()
+	if !snap.TelegramTokenFromEnv || !snap.TelegramChatIDFromEnv {
+		t.Fatalf("snapshot must mark Telegram fields as env-sourced: %+v", snap)
+	}
+	cfg2 := DefaultConfig()
+	snap2 := cfg2.Snapshot()
+	if snap2.TelegramTokenFromEnv || snap2.TelegramChatIDFromEnv {
+		t.Fatal("snapshot must not mark Telegram fields as env-sourced without env")
+	}
+}

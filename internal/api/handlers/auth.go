@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/skripsi/fim-ipl/internal/api/middleware"
 	"github.com/skripsi/fim-ipl/internal/config"
 	"github.com/skripsi/fim-ipl/internal/ledger"
+	"github.com/skripsi/fim-ipl/internal/models"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -187,6 +189,10 @@ func (h *AuthHandler) SetupAuditor(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
+	// Actor dihitung SEBELUM mutasi: mengatur auditor menaikkan epoch
+	// sesi, sehingga token pemanggil tidak valid lagi sesudahnya dan
+	// actor yang dibaca belakangan menjadi "(tidak dikenal)".
+	actor := actorFromRequest(r, h.cfg, h.ledger)
 
 	h.setupMu.Lock()
 	defer h.setupMu.Unlock()
@@ -244,9 +250,11 @@ func (h *AuthHandler) SetupAuditor(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[Auth] Auditor account created/rotated for user %q; all sessions invalidated (epoch bump)", username)
 
+	audited := appendAdminBlock(h.ledger, actor, models.ActionAuditorSet, fmt.Sprintf("auditor: %s", username))
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"message": "auditor account created",
+		"audited": audited,
 	})
 }
 

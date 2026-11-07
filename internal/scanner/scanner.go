@@ -18,8 +18,11 @@ import (
 )
 
 type Scanner struct {
-	workerCount     int
-	watchPaths      []string
+	workerCount int
+	watchPaths  []string
+	// excludeGlobs adalah pola pengecualian T-05 (lihat exclude.go).
+	// Nil = tidak ada pengecualian selain kebijakan uploads bawaan.
+	excludeGlobs    []string
 	mu              sync.RWMutex
 	isRunning       bool
 	isScanning      bool
@@ -46,6 +49,32 @@ func New(workerCount int, watchPaths []string) *Scanner {
 		stopChan:    make(chan struct{}),
 		intervalCh:  make(chan int, 1),
 	}
+}
+
+// SetExcludeGlobs mengganti pola pengecualian (T-05). Salinan disimpan
+// agar perubahan slice oleh pemanggil tidak memengaruhi scanner.
+func (s *Scanner) SetExcludeGlobs(globs []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if globs == nil {
+		s.excludeGlobs = nil
+		return
+	}
+	cp := make([]string, len(globs))
+	copy(cp, globs)
+	s.excludeGlobs = cp
+}
+
+// Exclusions mengembalikan snapshot aturan pengecualian untuk satu siklus
+// pemindaian (pola glob + watch path saat ini).
+func (s *Scanner) Exclusions() *Exclusions {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	globs := make([]string, len(s.excludeGlobs))
+	copy(globs, s.excludeGlobs)
+	paths := make([]string, len(s.watchPaths))
+	copy(paths, s.watchPaths)
+	return &Exclusions{Globs: globs, WatchPaths: paths}
 }
 
 // SetMaintenanceMode mengaktifkan/menonaktifkan mode maintenance.
@@ -388,15 +417,22 @@ func (s *Scanner) RegisterScanCycle(fn func()) {
 	s.scanCycleFn = fn
 }
 
-// UpdateConfig menerapkan perubahan worker, watch path, dan interval tanpa
-// restart daemon. Interval baru langsung dipakai ticker yang sedang berjalan.
-func (s *Scanner) UpdateConfig(workerCount int, watchPaths []string, intervalSec int) {
+// UpdateConfig menerapkan perubahan worker, watch path, interval, dan
+// pola pengecualian tanpa restart daemon. Interval baru langsung dipakai
+// ticker yang sedang berjalan. excludeGlobs nil berarti "tidak diubah";
+// slice kosong eksplisit berarti "hapus semua pola" (T-05).
+func (s *Scanner) UpdateConfig(workerCount int, watchPaths []string, intervalSec int, excludeGlobs []string) {
 	s.mu.Lock()
 	if workerCount > 0 {
 		s.workerCount = workerCount
 	}
 	if len(watchPaths) > 0 {
 		s.watchPaths = watchPaths
+	}
+	if excludeGlobs != nil {
+		cp := make([]string, len(excludeGlobs))
+		copy(cp, excludeGlobs)
+		s.excludeGlobs = cp
 	}
 	running := s.isRunning
 	s.mu.Unlock()

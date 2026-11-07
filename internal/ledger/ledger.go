@@ -150,6 +150,140 @@ func (l *Ledger) GetBaselineCount() (int, error) {
 	return count, err
 }
 
+// ---------------------------------------------------------------------------
+// Digest baseline (T-04, v1.6.0)
+// ---------------------------------------------------------------------------
+//
+// Baseline hidup di bucket Bbolt yang TIDAK masuk hash-chain: root yang
+// mengedit satu entri baseline secara langsung tidak merusak rantai.
+// Digest menutup celah itu: setiap blok BASELINE_INIT/BASELINE_UPDATE
+// membawa SHA-256 atas seluruh isi baseline pada saat itu (ikut dihitung
+// ke dalam hash blok v3), sehingga perubahan diam-diam pada baseline
+// terdeteksi dengan membandingkan digest blok terakhir dengan digest
+// baseline saat ini (lihat VerifyBaselineDigest).
+
+// baselineDigestFor menghitung SHA-256 atas isi baseline dalam format
+// kanonis: satu baris per berkas, "path|hash|mode|size\n" (mode dan size
+// dalam desimal), diurutkan berdasarkan path. Format ini didokumentasikan
+// agar verifier mandiri (T-06, cmd/verify) dapat menghitung ulang digest
+// yang sama dari ekspor JSON.
+func baselineDigestFor(records map[string]models.FileRecord) (string, int) {
+	paths := make([]string, 0, len(records))
+	for path := range records {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	var sb strings.Builder
+	for _, path := range paths {
+		r := records[path]
+		fmt.Fprintf(&sb, "%s|%s|%d|%d\n", path, r.Hash, r.Mode, r.Size)
+	}
+	sum := sha256.Sum256([]byte(sb.String()))
+	return hex.EncodeToString(sum[:]), len(paths)
+}
+
+// BaselineDigest menghitung digest baseline saat ini.
+func (l *Ledger) BaselineDigest() (string, int, error) {
+	records, err := l.GetBaseline()
+	if err != nil {
+		return "", 0, err
+	}
+	digest, count := baselineDigestFor(records)
+	return digest, count, nil
+}
+
+// LatestBaselineBlock mengembalikan blok BASELINE_INIT/BASELINE_UPDATE
+// terbaru (nil bila baseline belum pernah dibuat).
+func (l *Ledger) LatestBaselineBlock() (*models.Block, error) {
+	var found *models.Block
+	err := l.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketBlocks)
+		if b == nil {
+			return nil
+		}
+		cursor := b.Cursor()
+		for k, v := cursor.Last(); k != nil; k, v = cursor.Prev() {
+			var block models.Block
+			if err := json.Unmarshal(v, &block); err != nil {
+				continue
+			}
+			if block.Action == models.ActionBaselineInit || block.Action == models.ActionBaselineUpdate {
+				found = &block
+				return nil
+			}
+		}
+		return nil
+	})
+	return found, err
+}
+
+// BaselineVerification adalah hasil perbandingan digest blok baseline
+// terakhir dengan digest baseline saat ini.
+type BaselineVerification struct {
+	Match          bool   `json:"match"`
+	BlockID        string `json:"block_id"`
+	ExpectedDigest string `json:"expected_digest"`
+	ActualDigest   string `json:"actual_digest"`
+	ExpectedCount  int    `json:"expected_count"`
+	ActualCount    int    `json:"actual_count"`
+	Message        string `json:"message"`
+}
+
+// VerifyBaselineDigest membandingkan digest pada blok baseline terakhir
+// dengan digest baseline saat ini. Ketidakcocokan berarti ada entri
+// baseline yang berubah di luar jalur resmi (edit langsung di Bbolt,
+// atau rebuild yang tidak tercatat). Verifikasi ini TIDAK memeriksa
+// hash-chain — itu tugas VerifyChain; keduanya saling melengkapi.
+func (l *Ledger) VerifyBaselineDigest() (BaselineVerification, error) {
+	block, err := l.LatestBaselineBlock()
+	if err != nil {
+		return BaselineVerification{}, err
+	}
+	actualDigest, actualCount, err := l.BaselineDigest()
+	if err != nil {
+		return BaselineVerification{}, err
+	}
+	if block == nil {
+		return BaselineVerification{
+			Match:        false,
+			ActualDigest: actualDigest,
+			ActualCount:  actualCount,
+			Message:      "belum ada blok baseline: baseline belum pernah dibuat",
+		}, nil
+	}
+	if block.BaselineDigest == "" {
+		return BaselineVerification{
+			Match:         false,
+			BlockID:       block.ID,
+			ActualDigest:  actualDigest,
+			ActualCount:   actualCount,
+			ExpectedCount: block.BaselineCount,
+			Message:       "blok baseline terakhir tidak membawa digest (dibuat sebelum v1.6.0)",
+		}, nil
+	}
+	if block.BaselineDigest == actualDigest && block.BaselineCount == actualCount {
+		return BaselineVerification{
+			Match:          true,
+			BlockID:        block.ID,
+			ExpectedDigest: block.BaselineDigest,
+			ActualDigest:   actualDigest,
+			ExpectedCount:  block.BaselineCount,
+			ActualCount:    actualCount,
+			Message:        "baseline cocok dengan blok baseline terakhir",
+		}, nil
+	}
+	return BaselineVerification{
+		Match:          false,
+		BlockID:        block.ID,
+		ExpectedDigest: block.BaselineDigest,
+		ActualDigest:   actualDigest,
+		ExpectedCount:  block.BaselineCount,
+		ActualCount:    actualCount,
+		Message:        "baseline BERBEDA dari blok baseline terakhir: ada entri yang berubah di luar jalur resmi",
+	}, nil
+}
+
 // UpdateBaselineEntry memperbarui hash file di baseline (untuk kasus MODIFIED/CREATED)
 func (l *Ledger) UpdateBaselineEntry(record models.FileRecord) error {
 	return l.db.Update(func(tx *bolt.Tx) error {
@@ -242,9 +376,22 @@ func (l *Ledger) RecordQuarantineMode(path string, mode uint32) error {
 	})
 }
 
-// GetQuarantineMode mengembalikan permission asli file. found=false berarti
-// tidak ada catatan (file lama atau tidak pernah dikarantina lewat v1.1.0).
+// GetQuarantineMode mengembalikan permission asli file yang sedang
+// dikarantina — yaitu permission yang akan dipulihkan saat Release.
+// found=false berarti tidak ada catatan (file lama atau tidak pernah
+// dikarantina lewat v1.1.0).
+//
+// Sejak v1.6.0 (T-04), sumber utamanya adalah RANTAI: mode pada blok
+// karantina terakhir untuk path itu (NewMode; OldMode bila NewMode
+// kosong). Mode pada blok v2/v3 ikut terlindungi hash, sehingga
+// pengeditan diam-diam pada bucket quarantine_modes (yang mutable dan
+// di luar rantai) tidak lagi bisa mengubah mode pemulihan. Bucket hanya
+// dipakai sebagai fallback untuk karantina lama yang bloknya tidak
+// membawa mode (mis. blok v1.0 tanpa OldMode/NewMode).
 func (l *Ledger) GetQuarantineMode(path string) (uint32, bool, error) {
+	if mode, found, err := l.getQuarantineModeFromChain(path); err == nil && found {
+		return mode, true, nil
+	}
 	var (
 		mode  uint32
 		found bool
@@ -260,6 +407,44 @@ func (l *Ledger) GetQuarantineMode(path string) (uint32, bool, error) {
 		}
 		mode = binary.BigEndian.Uint32(v)
 		found = true
+		return nil
+	})
+	return mode, found, err
+}
+
+// getQuarantineModeFromChain mencari blok karantina terakhir untuk satu
+// path (paling baru dulu) dan mengembalikan modenya. Blok yang
+// dipertimbangkan adalah blok dengan Quarantined=true; blok RELEASED dan
+// DELETED tidak pernah membawa Quarantined=true, jadi tidak terpilih.
+func (l *Ledger) getQuarantineModeFromChain(path string) (uint32, bool, error) {
+	var (
+		mode  uint32
+		found bool
+	)
+	err := l.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketBlocks)
+		if b == nil {
+			return nil
+		}
+		cursor := b.Cursor()
+		for k, v := cursor.Last(); k != nil; k, v = cursor.Prev() {
+			var block models.Block
+			if err := json.Unmarshal(v, &block); err != nil {
+				continue
+			}
+			if block.FilePath != path || !block.Quarantined {
+				continue
+			}
+			switch {
+			case block.NewMode != 0:
+				mode = block.NewMode
+				found = true
+			case block.OldMode != 0:
+				mode = block.OldMode
+				found = true
+			}
+			return nil
+		}
 		return nil
 	})
 	return mode, found, err
@@ -364,14 +549,24 @@ func (l *Ledger) AppendBlock(event models.AnomalyEvent) (*models.Block, error) {
 			Action:    event.Action,
 			OldHash:   event.OldHash,
 			NewHash:   event.NewHash,
-			// OldMode/NewMode hanya metadata tampilan: TIDAK ikut dihitung
-			// ke dalam block hash (seperti QuarantineErr), agar blok lama
-			// tetap terverifikasi.
+			// OldMode/NewMode dan QuarantineErr ikut dihitung ke dalam
+			// block hash pada blok v2 (lihat calculateBlockHashV2); pada
+			// blok v1 keduanya hanya metadata tampilan.
 			OldMode:       event.OldMode,
 			NewMode:       event.NewMode,
 			Quarantined:   event.Quarantined,
 			QuarantineErr: event.QuarantineErr,
-			PrevBlockHash: prevHash,
+			Actor:         event.Actor,
+			Detail:        event.Detail,
+			// Digest baseline (T-04): hanya terisi pada blok
+			// BASELINE_INIT/BASELINE_UPDATE; kosong untuk blok lain.
+			BaselineDigest: event.BaselineDigest,
+			BaselineCount:  event.BaselineCount,
+			PrevBlockHash:  prevHash,
+			// Blok baru selalu memakai formula terbaru (v3); blok v1/v2
+			// yang sudah ada tetap terverifikasi lewat formula lamanya
+			// (lihat calculateBlockHash).
+			HashVersion: 3,
 		}
 
 		block.BlockHash = calculateBlockHash(block)
@@ -627,7 +822,7 @@ func (l *Ledger) GetDashboardCounts() (DashboardCounts, error) {
 				continue
 			}
 
-			if block.Action != models.ActionReleased {
+			if models.IsAnomalyAction(block.Action) {
 				counts.Anomalies++
 			}
 
@@ -692,70 +887,159 @@ type VerifyResult struct {
 // VerifyChain memeriksa integritas rantai blok secara menyeluruh:
 //  1. Setiap block[N].prev_block_hash == block[N-1].block_hash
 //  2. Setiap block_hash == SHA256(rekalkulasi dari isinya)
+//  3. Urutan dan ID blok konsisten (BLK-%06d berurutan)
 //
-// Jika ada kegagalan, FailedBlock diisi dengan ID block yang bermasalah.
+// Verifikasi isinya didelegasikan ke VerifyBlocks (fungsi murni tanpa
+// akses DB), agar verifier mandiri cmd/verify dapat memakai logika yang
+// persis sama terhadap ekspor JSON. Yang diperiksa VerifyChain di sini
+// hanyalah konsistensi kunci Bbolt dengan ID blok — sesuatu yang tidak
+// bisa diungkap dari ekspor saja.
 func (l *Ledger) VerifyChain() VerifyResult {
-	res := VerifyResult{
-		VerifiedAt: time.Now().UTC(),
-		HeadHash:   genesisPrevHash,
-	}
-
+	blocks := make([]models.Block, 0, 64)
 	err := l.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketBlocks)
 		if b == nil {
 			return nil
 		}
-		res.TotalBlocks = countKeys(b)
-		if res.TotalBlocks == 0 {
-			return nil
-		}
-
-		prevHash := genesisPrevHash
 		cursor := b.Cursor()
-
 		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
 			var block models.Block
 			if err := json.Unmarshal(v, &block); err != nil {
-				res.FailedBlock = string(k)
 				return fmt.Errorf("invalid block data at key %s", string(k))
 			}
-
 			// Key harus berupa sequence dan cocok dengan ID blok.
 			seq, err := strconv.Atoi(string(k))
 			if err != nil || block.ID != fmt.Sprintf("BLK-%06d", seq) {
-				res.FailedBlock = block.ID
 				return fmt.Errorf("block %s has inconsistent sequence key %q", block.ID, string(k))
 			}
-
-			if block.PrevBlockHash != prevHash {
-				res.FailedBlock = block.ID
-				return fmt.Errorf("chain broken at block %s: expected prev_hash %s, got %s",
-					block.ID, prevHash, block.PrevBlockHash)
-			}
-
-			expectedHash := calculateBlockHash(block)
-			if block.BlockHash != expectedHash {
-				res.FailedBlock = block.ID
-				return fmt.Errorf("block %s hash mismatch: expected %s, got %s",
-					block.ID, expectedHash, block.BlockHash)
-			}
-
-			prevHash = block.BlockHash
-			res.HeadBlockID = block.ID
-			res.HeadHash = block.BlockHash
+			blocks = append(blocks, block)
 		}
 		return nil
 	})
-
 	if err != nil {
-		res.Valid = false
-		res.Message = err.Error()
+		return VerifyResult{
+			VerifiedAt: time.Now().UTC(),
+			HeadHash:   genesisPrevHash,
+			Valid:      false,
+			Message:    err.Error(),
+		}
+	}
+	return VerifyBlocks(blocks)
+}
+
+// VerifyBlocks memeriksa integritas rantai dari daftar blok yang
+// diberikan (tanpa akses DB). Dipakai VerifyChain dan verifier mandiri
+// cmd/verify — keduanya menjalankan logika yang persis sama, sehingga
+// hasil verifikasi dari ekspor tidak bisa berbeda dari verifikasi
+// langsung di server.
+//
+// BATAS YANG JUJUR (single-node ledger): fungsi ini TIDAK dapat
+// mendeteksi pemotongan ekor (tail truncation) — menghapus blok-blok
+// terakhir menghasilkan rantai yang lebih pendek tetapi tetap utuh.
+// Yang mendeteksinya adalah perbandingan dengan jangkar eksternal
+// (head hash di alert Telegram / caption backup, T-06): bila head hash
+// di Telegram tidak sama dengan head hash rantai saat ini, ada blok
+// yang hilang.
+func VerifyBlocks(blocks []models.Block) VerifyResult {
+	res := VerifyResult{
+		VerifiedAt:  time.Now().UTC(),
+		HeadHash:    genesisPrevHash,
+		TotalBlocks: len(blocks),
+	}
+	if len(blocks) == 0 {
+		res.Valid = true
+		res.Message = "chain intact (empty)"
 		return res
+	}
+
+	prevHash := genesisPrevHash
+	for i, block := range blocks {
+		// ID harus BLK-%06d berurutan sesuai posisi di rantai.
+		wantID := fmt.Sprintf("BLK-%06d", i+1)
+		if block.ID != wantID {
+			res.FailedBlock = block.ID
+			res.Valid = false
+			res.Message = fmt.Sprintf("block %s has inconsistent sequence (expected %s)", block.ID, wantID)
+			return res
+		}
+
+		// Versi formula yang tidak dikenal ditolak di sini, bukan
+		// diam-diam diverifikasi dengan formula lama.
+		if block.HashVersion != 0 && block.HashVersion != 2 && block.HashVersion != 3 {
+			res.FailedBlock = block.ID
+			res.Valid = false
+			res.Message = fmt.Sprintf("block %s has unknown hash_version %d", block.ID, block.HashVersion)
+			return res
+		}
+
+		if block.PrevBlockHash != prevHash {
+			res.FailedBlock = block.ID
+			res.Valid = false
+			res.Message = fmt.Sprintf("chain broken at block %s: expected prev_hash %s, got %s",
+				block.ID, prevHash, block.PrevBlockHash)
+			return res
+		}
+
+		expectedHash := calculateBlockHash(block)
+		if block.BlockHash != expectedHash {
+			res.FailedBlock = block.ID
+			res.Valid = false
+			res.Message = fmt.Sprintf("block %s hash mismatch: expected %s, got %s",
+				block.ID, expectedHash, block.BlockHash)
+			return res
+		}
+
+		prevHash = block.BlockHash
+		res.HeadBlockID = block.ID
+		res.HeadHash = block.BlockHash
 	}
 
 	res.Valid = true
 	res.Message = "chain intact"
 	return res
+}
+
+// RecordVerification menyimpan hasil verifikasi terjadwal terakhir di
+// bucket meta (T-06). Satu entri saja yang disimpan (kunci
+// "last_verification") — riwayat verifikasi tidak diperlukan, yang
+// penting adalah status terakhir yang bisa dibandingkan dengan jangkar
+// eksternal.
+func (l *Ledger) RecordVerification(v models.LastVerification) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return l.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketMeta)
+		if b == nil {
+			return fmt.Errorf("meta bucket missing")
+		}
+		return b.Put([]byte("last_verification"), data)
+	})
+}
+
+// GetLastVerification mengembalikan hasil verifikasi terjadwal terakhir,
+// atau nil bila belum pernah ada verifikasi (mis. sebelum boot pertama
+// dengan v1.6.0).
+func (l *Ledger) GetLastVerification() (*models.LastVerification, error) {
+	var v *models.LastVerification
+	err := l.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketMeta)
+		if b == nil {
+			return nil
+		}
+		data := b.Get([]byte("last_verification"))
+		if data == nil {
+			return nil
+		}
+		var lv models.LastVerification
+		if err := json.Unmarshal(data, &lv); err != nil {
+			return err
+		}
+		v = &lv
+		return nil
+	})
+	return v, err
 }
 
 func lastBlockHash(b *bolt.Bucket) (string, error) {
@@ -772,9 +1056,31 @@ func lastBlockHash(b *bolt.Bucket) (string, error) {
 	return block.BlockHash, nil
 }
 
-// calculateBlockHash memasukkan field Quarantined ke dalam material hash sehingga
-// setiap perubahan pada status karantina juga akan terdeteksi oleh VerifyChain.
+// calculateBlockHash memilih formula berdasarkan HashVersion blok:
+// 0 (field tidak ada) = v1, 2 = v2, 3 = v3. Versi tidak dikenal tidak
+// punya hash yang cocok, sehingga VerifyChain gagal di blok itu.
+// Setiap versi formula tidak pernah diubah setelah didefinisikan;
+// kebutuhan baru (seperti digest baseline di v3) memakai versi baru.
 func calculateBlockHash(block models.Block) string {
+	switch block.HashVersion {
+	case 3:
+		return calculateBlockHashV3(block)
+	case 2:
+		return calculateBlockHashV2(block)
+	case 0:
+		return calculateBlockHashV1(block)
+	default:
+		return ""
+	}
+}
+
+// calculateBlockHashV1 adalah formula lama (v1.0–v1.5.0), dipertahankan
+// tanpa perubahan agar 29 blok produksi yang sudah ada tetap
+// terverifikasi. Formula ini hanya melindungi
+// ID|Timestamp|FilePath|Action|OldHash|NewHash|PrevBlockHash|Quarantined,
+// dan pemisah "|" tidak di-escape: dua tuple field yang berbeda bisa
+// menghasilkan string yang sama bila path/aksi mengandung "|".
+func calculateBlockHashV1(block models.Block) string {
 	data := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%t",
 		block.ID,
 		block.Timestamp.Format(time.RFC3339Nano),
@@ -786,6 +1092,72 @@ func calculateBlockHash(block models.Block) string {
 		block.Quarantined,
 	)
 	hash := sha256.Sum256([]byte(data))
+	return hex.EncodeToString(hash[:])
+}
+
+// calculateBlockHashV2 (v1.6.0, T-02) melindungi SELURUH field kejadian:
+// ID, Timestamp, FilePath, Action, OldHash, NewHash, OldMode, NewMode,
+// Quarantined, QuarantineErr, Actor, Detail, PrevBlockHash, dan
+// HashVersion sendiri. Pada v1, perubahan MODE_CHANGED tidak terlindungi
+// karena OldHash == NewHash dan mode tidak masuk material hash — kini
+// mengubah mode (atau alasan karantina, atau pelaku) tanpa memperbarui
+// hash akan gagal tepat di blok itu.
+//
+// Encoding-nya length-prefixed ("panjang:nilai" per field, urutan
+// tetap), sehingga batas field tidak pernah ambigu: path yang mengandung
+// "|" atau ":" tidak bisa dipalsukan menjadi field lain, tidak seperti
+// pemisah "|" pada v1.
+func calculateBlockHashV2(block models.Block) string {
+	var sb strings.Builder
+	writeField := func(s string) {
+		fmt.Fprintf(&sb, "%d:%s", len(s), s)
+	}
+	writeField(strconv.Itoa(block.HashVersion))
+	writeField(block.ID)
+	writeField(block.Timestamp.Format(time.RFC3339Nano))
+	writeField(block.FilePath)
+	writeField(block.Action)
+	writeField(block.OldHash)
+	writeField(block.NewHash)
+	writeField(strconv.FormatUint(uint64(block.OldMode), 10))
+	writeField(strconv.FormatUint(uint64(block.NewMode), 10))
+	writeField(strconv.FormatBool(block.Quarantined))
+	writeField(block.QuarantineErr)
+	writeField(block.Actor)
+	writeField(block.Detail)
+	writeField(block.PrevBlockHash)
+	hash := sha256.Sum256([]byte(sb.String()))
+	return hex.EncodeToString(hash[:])
+}
+
+// calculateBlockHashV3 (v1.6.0, T-04) = v2 ditambah BaselineDigest dan
+// BaselineCount di akhir material hash, dengan urutan field yang sama.
+// Blok baseline (BASELINE_INIT/BASELINE_UPDATE) kini membawa digest isi
+// baseline yang ikut terlindungi hash, sehingga digest itu sendiri tidak
+// bisa diubah tanpa merusak rantai. Blok non-baseline memakai digest
+// kosong ("0:") dan count 0, jadi tidak ada ambiguitas.
+func calculateBlockHashV3(block models.Block) string {
+	var sb strings.Builder
+	writeField := func(s string) {
+		fmt.Fprintf(&sb, "%d:%s", len(s), s)
+	}
+	writeField(strconv.Itoa(block.HashVersion))
+	writeField(block.ID)
+	writeField(block.Timestamp.Format(time.RFC3339Nano))
+	writeField(block.FilePath)
+	writeField(block.Action)
+	writeField(block.OldHash)
+	writeField(block.NewHash)
+	writeField(strconv.FormatUint(uint64(block.OldMode), 10))
+	writeField(strconv.FormatUint(uint64(block.NewMode), 10))
+	writeField(strconv.FormatBool(block.Quarantined))
+	writeField(block.QuarantineErr)
+	writeField(block.Actor)
+	writeField(block.Detail)
+	writeField(block.BaselineDigest)
+	writeField(strconv.Itoa(block.BaselineCount))
+	writeField(block.PrevBlockHash)
+	hash := sha256.Sum256([]byte(sb.String()))
 	return hex.EncodeToString(hash[:])
 }
 

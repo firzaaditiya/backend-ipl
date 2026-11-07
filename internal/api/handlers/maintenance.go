@@ -20,13 +20,14 @@ import (
 // MaintenanceHandler menangani toggle maintenance mode dan rebuild baseline
 // pasca update / instalasi plugin.
 type MaintenanceHandler struct {
+	cfg     *config.Config
 	scanner *scanner.Scanner
 	ledger  *ledger.Ledger
 	hub     *realtime.Hub
 }
 
-func NewMaintenanceHandler(s *scanner.Scanner, l *ledger.Ledger, hub *realtime.Hub) *MaintenanceHandler {
-	return &MaintenanceHandler{scanner: s, ledger: l, hub: hub}
+func NewMaintenanceHandler(cfg *config.Config, s *scanner.Scanner, l *ledger.Ledger, hub *realtime.Hub) *MaintenanceHandler {
+	return &MaintenanceHandler{cfg: cfg, scanner: s, ledger: l, hub: hub}
 }
 
 func (h *MaintenanceHandler) Enable(w http.ResponseWriter, r *http.Request) {
@@ -34,12 +35,17 @@ func (h *MaintenanceHandler) Enable(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
+	// Actor dihitung di awal: mutasi di bawah tidak menaikkan epoch, tetapi
+	// polanya diseragamkan dengan handler lain (lihat appendAdminBlock).
+	actor := actorFromRequest(r, h.cfg, h.ledger)
 	h.scanner.SetMaintenanceMode(true)
 	log.Println("[Maintenance] Mode ENABLED - scan cycles akan di-skip")
 	publishState(h.hub, h.scanner, "maintenance_enabled")
+	audited := appendAdminBlock(h.ledger, actor, models.ActionMaintenanceOn, "")
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"maintenance_mode": true,
 		"message":          "maintenance mode enabled",
+		"audited":          audited,
 	})
 }
 
@@ -48,12 +54,15 @@ func (h *MaintenanceHandler) Disable(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
+	actor := actorFromRequest(r, h.cfg, h.ledger)
 	h.scanner.SetMaintenanceMode(false)
 	log.Println("[Maintenance] Mode DISABLED - scan cycles resumed")
 	publishState(h.hub, h.scanner, "maintenance_disabled")
+	audited := appendAdminBlock(h.ledger, actor, models.ActionMaintenanceOff, "")
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"maintenance_mode": false,
 		"message":          "maintenance mode disabled",
+		"audited":          audited,
 	})
 }
 
@@ -65,6 +74,7 @@ func (h *MaintenanceHandler) UpdateBaseline(w http.ResponseWriter, r *http.Reque
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
+	actor := actorFromRequest(r, h.cfg, h.ledger)
 
 	if h.scanner.IsRunning() && !h.scanner.IsMaintenance() {
 		writeJSON(w, http.StatusConflict, map[string]string{
@@ -97,6 +107,14 @@ func (h *MaintenanceHandler) UpdateBaseline(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Alasan rebuild wajib (T-03): rebuild baseline menghapus jejak
+	// perubahan sebelumnya, jadi alasannya harus tercatat di ledger.
+	reason, ok := parseReason(r)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "reason required (1-500 characters)"})
+		return
+	}
+
 	log.Println("[Maintenance] Rebuilding baseline...")
 
 	total, err := scanAndSaveBaseline(h.scanner, h.ledger)
@@ -108,10 +126,19 @@ func (h *MaintenanceHandler) UpdateBaseline(w http.ResponseWriter, r *http.Reque
 
 	log.Printf("[Maintenance] Baseline rebuilt with %d files", total)
 	publishState(h.hub, h.scanner, "baseline_rebuilt")
+	detail := reason
+	audited := false
+	if digest, count, derr := h.ledger.BaselineDigest(); derr != nil {
+		log.Printf("[Maintenance] Baseline rebuilt but failed to compute digest: %v", derr)
+		appendAdminBlock(h.ledger, actor, models.ActionBaselineUpdate, detail)
+	} else {
+		audited = appendAdminBlockWithDigest(h.ledger, actor, models.ActionBaselineUpdate, detail, digest, count)
+	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"message":     "baseline rebuilt successfully",
 		"total_files": total,
+		"audited":     audited,
 	})
 }
 
@@ -139,11 +166,22 @@ func (h *QuarantineHandler) Release(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
+	actor := actorFromRequest(r, h.cfg, h.ledger)
 	var req struct {
 		FilePath string `json:"file_path"`
+		Reason   string `json:"reason"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.FilePath == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "file_path required"})
+		return
+	}
+
+	// Alasan pelepasan wajib (T-03): pelepasan adalah persetujuan operator
+	// atas berkas yang tadinya dikarantina, jadi alasannya harus tercatat
+	// di ledger bersama siapa yang melepas.
+	reason, ok := validateReason(req.Reason)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "reason required (1-500 characters)"})
 		return
 	}
 
@@ -192,6 +230,8 @@ func (h *QuarantineHandler) Release(w http.ResponseWriter, r *http.Request) {
 	if _, err := h.ledger.AppendBlock(models.AnomalyEvent{
 		FilePath: cleanPath,
 		Action:   models.ActionReleased,
+		Actor:    actor,
+		Detail:   reason,
 	}); err != nil {
 		audited = false
 		log.Printf("[Quarantine] Released %s but failed to record audit block: %v", cleanPath, err)

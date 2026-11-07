@@ -12,14 +12,23 @@ Environment=FIM_CONFIG_PATH=/opt/fim-ipl/data/config.json
 EnvironmentFile=-/etc/fim-ipl/fim.env
 Environment=FIM_STRICT_SECRETS=1
 # FIM_REQUIRE_EXTERNAL_SECRETS=1 hanya untuk deployment yang mengelola
-# SEMUA kredensial lewat environment/secret manager dan TIDAK memakai
-# Settings API untuk Telegram/Auditor (API itu menulis ke config.json).
-# Bila Settings API dipakai untuk kredensial, flag ini membuat boot gagal
-# by design. Deployment produksi TPQ Al-Fawwaz memakai Settings API, jadi
-# flag ini dimatikan di unit produksi (bukan di template ini).
+# SEMUA kredensial lewat environment/secret manager. Telegram yang
+# dikelola env tidak boleh diubah lewat Settings API (API itu menulis ke
+# config.json — dengan flag ini, boot berikutnya akan GAGAL by design;
+# UpdateSettings menolak perubahan Telegram bila sumbernya env, T-07).
+# Pengecualian: hash bcrypt auditor di config.json DIIZINKAN (auditor
+# dibuat saat runtime lewat API; user daemon tidak bisa menulis fim.env
+# yang root:root 0600). Bila deployment memakai Settings API untuk
+# Telegram, matikan flag ini dan terima config.json (0600, milik fim-ipl)
+# sebagai sumber kebenaran runtime untuk Telegram. Produksi TPQ
+# Al-Fawwaz: flag ini diaktifkan sebagai bagian dari langkah produksi
+# T-07 (Telegram pindah ke fim.env; butuh persetujuan sebelum deploy).
 Environment=FIM_REQUIRE_EXTERNAL_SECRETS=1
 Environment=FIM_REQUIRE_LOCAL_API=1
 Environment=FIM_SERVER_PORT=127.0.0.1:8080
+# Cookie sesi Secure eksplisit (default kode sudah true; ditulis eksplisit
+# agar sama dengan unit produksi, yang menaruhnya di override.conf).
+Environment=FIM_COOKIE_SECURE=1
 UMask=0077
 ExecStart=/opt/fim-ipl/fim-ipl
 Restart=on-failure
@@ -40,6 +49,21 @@ ProtectHome=true
 # membuat/menghapus file di sana — hanya chmod yang diizinkan capability.
 ReadWritePaths=/opt/fim-ipl/data /var/www/html
 SupplementaryGroups=www-data
+# Batas sumber daya (T-08, v1.6.0): sebelumnya unit ini tidak punya batas
+# apa pun — angka memori di naskah hanya klaim, bukan penegakan. Daemon
+# yang lepas kendali (mis. kebocoran memori saat scan) bisa menekan
+# PHP-FPM di 1 vCPU yang sama sampai situs mati. Batas ini diukur, bukan
+# ditebak: RSS daemon ~18 MB saat scan 3.901 berkas (HeapAlloc Go ~2 MB),
+# jadi MemoryMax=256M memberi ruang ~14x dengan tetap menjadi batas nyata;
+# Nice=10 + CPUWeight=10 membuat scheduler mendahulukan PHP-FPM bila CPU
+# diperebutkan; IOSchedulingClass=idle membuat I/O scan mengalah pada
+# I/O web. Bila daemon mati karena OOM (exit 137 / "memory cgroup out of
+# memory" di journal), naikkan MemoryMax setelah mengukur ulang — jangan
+# menghapus batasnya.
+MemoryMax=256M
+CPUWeight=10
+Nice=10
+IOSchedulingClass=idle
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
