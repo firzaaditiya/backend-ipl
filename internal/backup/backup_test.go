@@ -41,7 +41,7 @@ func TestFormatCaptionIncludesHeadAnchor(t *testing.T) {
 		"💾 <b>FIM-IPL · Backup Ledger</b>",
 		"<b>Jenis:</b> manual",
 		"<b>Total blok:</b> 12",
-		"✅ UTUH",
+		"<b>Verifikasi:</b> UTUH",
 		"<b>Head hash:</b> <code>" + strings.Repeat("f", 64) + "</code>",
 		"fim-ipl-ledger-manual-1.json",
 	} {

@@ -29,9 +29,8 @@ const (
 
 // Telegram adalah klien Bot API untuk notifikasi operasional.
 //
-// Pesan dikirim sebagai HTML (parse_mode=HTML) dengan emoji secukupnya:
-// judul tebal, nilai (path, hash, ID) dalam <code>, dan emoji hanya pada
-// baris yang menandai jenis atau tingkat keparahan pesan. Semua nilai
+// Pesan dikirim sebagai HTML (parse_mode=HTML) dengan emoji hanya pada
+// judul pesan: judul tebal, nilai (path, hash, ID) dalam <code>. Semua nilai
 // dinamis di-escape (esc) agar karakter < > & dari nama file atau alasan
 // tidak bisa merusak format atau menyuntikkan tag. Bila Telegram menolak
 // format HTML (400), pesan dikirim ulang sekali sebagai teks biasa.
@@ -413,7 +412,7 @@ func (t *Telegram) endpoint(token, method string) string {
 }
 
 // ---------------------------------------------------------------------------
-// Message formatting (HTML, Bahasa Indonesia, emoji secukupnya)
+// Message formatting (HTML, Bahasa Indonesia, emoji hanya di judul)
 // ---------------------------------------------------------------------------
 
 // esc membersihkan nilai dinamis (path, alasan, ID, hash) lalu meng-escape
@@ -447,12 +446,12 @@ func formatAlertMessage(block *models.Block) string {
 		fmt.Fprintf(&b, "<b>%s</b> · %s\n", esc(block.Action), esc(actionDesc(block.Action)))
 	} else {
 		b.WriteString("🛡️ <b>FIM-IPL · Perubahan File Terdeteksi</b>\n\n")
-		fmt.Fprintf(&b, "%s <b>%s</b> · %s\n", actionEmoji(block.Action), esc(block.Action), esc(actionDesc(block.Action)))
+		fmt.Fprintf(&b, "<b>%s</b> · %s\n", esc(block.Action), esc(actionDesc(block.Action)))
 	}
 	fmt.Fprintf(&b, "<b>Blok:</b> <code>%s</code>\n", esc(block.ID))
 	fmt.Fprintf(&b, "<b>Waktu:</b> %s\n", esc(formatTimestamp(block.Timestamp)))
 	fmt.Fprintf(&b, "<b>File:</b> <code>%s</code>\n", esc(block.FilePath))
-	fmt.Fprintf(&b, "<b>Status:</b> %s %s\n", quarantineEmoji(block), esc(quarantineStatus(block)))
+	fmt.Fprintf(&b, "<b>Status:</b> %s\n", esc(quarantineStatus(block)))
 	fmt.Fprintf(&b, "<b>Hash sebelum:</b> <code>%s</code>\n", esc(truncateHash(block.OldHash)))
 	fmt.Fprintf(&b, "<b>Hash sesudah:</b> <code>%s</code>\n", esc(truncateHash(block.NewHash)))
 	if block.Action == models.ActionModeChanged || block.Action == models.ActionQuarantineBreach {
@@ -463,7 +462,7 @@ func formatAlertMessage(block *models.Block) string {
 	// dipotong ekornya, head hash di Telegram tidak akan cocok dengan
 	// head hash rantai saat ini — itulah yang mendeteksi pemotongan yang
 	// tidak bisa dideteksi verifikasi lokal.
-	fmt.Fprintf(&b, "🔗 <b>Block hash:</b> <code>%s</code>\n", esc(block.BlockHash))
+	fmt.Fprintf(&b, "<b>Block hash:</b> <code>%s</code>\n", esc(block.BlockHash))
 
 	b.WriteString("\n<b>Tindakan yang disarankan:</b>\n")
 	switch {
@@ -498,7 +497,7 @@ func formatBatchMessage(blocks []*models.Block, total int) string {
 	b.WriteString("🛡️ <b>FIM-IPL · Ringkasan Anomali</b>\n\n")
 	fmt.Fprintf(&b, "<b>Waktu:</b> %s\n", esc(formatTimestamp(time.Now())))
 	fmt.Fprintf(&b, "<b>Total file:</b> %d\n", total)
-	fmt.Fprintf(&b, "<b>Rincian:</b> ✏️ %d diubah · 📄 %d baru · 🗑️ %d dihapus · ⚠️ %d tidak dapat dipindai\n", modified, created, deleted, unreadable)
+	fmt.Fprintf(&b, "<b>Rincian:</b> %d diubah, %d baru, %d dihapus, %d tidak dapat dipindai\n", modified, created, deleted, unreadable)
 
 	b.WriteString("\n<b>File yang terdeteksi:</b>\n")
 	listed := 0
@@ -507,7 +506,7 @@ func formatBatchMessage(blocks []*models.Block, total int) string {
 			continue
 		}
 		listed++
-		fmt.Fprintf(&b, "%d. %s <code>%s</code> · %s · <code>%s</code> · hash <code>%s</code>\n", listed, actionEmoji(block.Action), esc(block.FilePath), esc(block.Action), esc(block.ID), esc(truncateHash(block.BlockHash)))
+		fmt.Fprintf(&b, "%d. <code>%s</code> · %s · <code>%s</code> · hash <code>%s</code>\n", listed, esc(block.FilePath), esc(block.Action), esc(block.ID), esc(truncateHash(block.BlockHash)))
 	}
 	if remaining := total - listed; remaining > 0 {
 		fmt.Fprintf(&b, "... dan %d file lainnya.\n", remaining)
@@ -516,7 +515,7 @@ func formatBatchMessage(blocks []*models.Block, total int) string {
 	// pemotongan ekor terdeteksi dari Telegram walau verifikasi lokal
 	// terhadap rantai yang terpotong tetap lolos.
 	if head := headBlock(blocks); head != nil {
-		fmt.Fprintf(&b, "\n🔗 <b>Block terakhir:</b> <code>%s</code>\n🔗 <b>Hash rantai:</b> <code>%s</code>\n", esc(head.ID), esc(head.BlockHash))
+		fmt.Fprintf(&b, "\n<b>Block terakhir:</b> <code>%s</code>\n<b>Hash rantai:</b> <code>%s</code>\n", esc(head.ID), esc(head.BlockHash))
 	}
 
 	b.WriteString("\nDetail lengkap tersedia di dashboard, menu Audit Trail.")
@@ -541,7 +540,7 @@ func formatBulkWarningMessage(total int, blocks []*models.Block) string {
 
 	// Jangkar eksternal (T-06): lihat formatBatchMessage.
 	if head := headBlock(blocks); head != nil {
-		fmt.Fprintf(&b, "\n🔗 <b>Block terakhir:</b> <code>%s</code>\n🔗 <b>Hash rantai:</b> <code>%s</code>\n", esc(head.ID), esc(head.BlockHash))
+		fmt.Fprintf(&b, "\n<b>Block terakhir:</b> <code>%s</code>\n<b>Hash rantai:</b> <code>%s</code>\n", esc(head.ID), esc(head.BlockHash))
 	}
 
 	b.WriteString("\n<b>Tindakan:</b>\n")
@@ -587,29 +586,6 @@ func countActions(blocks []*models.Block) (modified, created, deleted, unreadabl
 	return modified, created, deleted, unreadable
 }
 
-// actionEmoji adalah emoji penanda satu aksi: dipakai pada baris aksi alert
-// per-blok dan pada daftar file ringkasan. Satu emoji per aksi, tidak lebih.
-func actionEmoji(action string) string {
-	switch action {
-	case models.ActionCreated:
-		return "📄"
-	case models.ActionModified:
-		return "✏️"
-	case models.ActionDeleted:
-		return "🗑️"
-	case models.ActionModeChanged:
-		return "🔐"
-	case models.ActionUnreadable:
-		return "⚠️"
-	case models.ActionQuarantineBreach:
-		return "🚨"
-	case models.ActionReleased:
-		return "🔓"
-	default:
-		return "🔍"
-	}
-}
-
 // actionDesc adalah label Bahasa Indonesia untuk satu aksi (tanpa kode aksi).
 func actionDesc(action string) string {
 	switch action {
@@ -629,22 +605,6 @@ func actionDesc(action string) string {
 		return "karantina dilepas"
 	default:
 		return cleanText(action)
-	}
-}
-
-// quarantineEmoji menandai status karantina pada baris status alert per-blok.
-func quarantineEmoji(block *models.Block) string {
-	switch {
-	case block.Action == models.ActionDeleted:
-		return "🗑️"
-	case block.Action == models.ActionUnreadable:
-		return "⚠️"
-	case block.Quarantined:
-		return "🔒"
-	case block.QuarantineErr != "":
-		return "❌"
-	default:
-		return "➖"
 	}
 }
 

@@ -33,9 +33,9 @@ func TestFormatAlertMessageHTMLAndSanitized(t *testing.T) {
 	for _, want := range []string{
 		"🛡️ <b>FIM-IPL · Perubahan File Terdeteksi</b>",
 		"<code>BLK-000001</code>",
-		"✏️ <b>MODIFIED</b> · isi file berubah",
+		"<b>MODIFIED</b> · isi file berubah",
 		"C:\\www\\site\\functions.php Pesan palsu",
-		"🔒 Berhasil dikarantina",
+		"Berhasil dikarantina",
 		"aaaaaaaa...aaaaaaaa",
 		"Tindakan yang disarankan:",
 	} {
@@ -256,7 +256,7 @@ func TestFormatUnreadableAlert(t *testing.T) {
 	msg := formatAlertMessage(block)
 
 	for _, want := range []string{
-		"⚠️ <b>UNREADABLE</b> · file tidak dapat dipindai",
+		"<b>UNREADABLE</b> · file tidak dapat dipindai",
 		"Tidak dapat dipindai: pemindaian: permission denied",
 		"Periksa izin file/folder",
 	} {

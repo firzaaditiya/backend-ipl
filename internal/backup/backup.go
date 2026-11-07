@@ -298,22 +298,14 @@ func formatCaption(label, filename string, exp *ledger.LedgerExport) string {
 			"<b>Jenis:</b> %s\n"+
 			"<b>Waktu:</b> %s\n"+
 			"<b>Total blok:</b> %d\n"+
-			"<b>Verifikasi:</b> %s %s\n"+
+			"<b>Verifikasi:</b> %s\n"+
 			"<b>Block terakhir:</b> <code>%s</code>\n"+
 			"<b>Head hash:</b> <code>%s</code>\n"+
 			"<b>File:</b> <code>%s</code>\n\n"+
 			"Simpan head hash ini di luar server untuk mendeteksi penghapusan blok terakhir.",
 		html.EscapeString(label), exp.GeneratedAt.Format("2006-01-02 15:04:05 UTC"),
-		exp.TotalBlocks, verifyIcon(exp.Verify.Valid), verifyLabel(exp.Verify.Valid), html.EscapeString(headBlockID), html.EscapeString(headHash), html.EscapeString(filename),
+		exp.TotalBlocks, verifyLabel(exp.Verify.Valid), html.EscapeString(headBlockID), html.EscapeString(headHash), html.EscapeString(filename),
 	)
-}
-
-// verifyIcon menandai hasil verifikasi rantai pada caption backup.
-func verifyIcon(valid bool) string {
-	if valid {
-		return "✅"
-	}
-	return "❌"
 }
 
 func (m *Manager) postWebhook(url, filename string, payload []byte) error {
