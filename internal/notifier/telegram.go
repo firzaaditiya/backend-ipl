@@ -3,7 +3,9 @@ package notifier
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"mime/multipart"
@@ -27,9 +29,12 @@ const (
 
 // Telegram adalah klien Bot API untuk notifikasi operasional.
 //
-// Pesan sengaja dikirim sebagai teks biasa (tanpa parse_mode) agar path file
-// Windows/Linux, karakter khusus, dan nama file tidak merusak format atau
-// ditolak Telegram.
+// Pesan dikirim sebagai HTML (parse_mode=HTML) dengan emoji secukupnya:
+// judul tebal, nilai (path, hash, ID) dalam <code>, dan emoji hanya pada
+// baris yang menandai jenis atau tingkat keparahan pesan. Semua nilai
+// dinamis di-escape (esc) agar karakter < > & dari nama file atau alasan
+// tidak bisa merusak format atau menyuntikkan tag. Bila Telegram menolak
+// format HTML (400), pesan dikirim ulang sekali sebagai teks biasa.
 type Telegram struct {
 	mu        sync.RWMutex
 	token     string
@@ -111,36 +116,46 @@ func (t *Telegram) SendTestMessage() error {
 	_, chatID := t.getCredentials()
 
 	msg := fmt.Sprintf(
-		"FIM-IPL: TES NOTIFIKASI\n\n"+
+		"✅ <b>FIM-IPL · Tes Notifikasi</b>\n\n"+
 			"Konfigurasi Telegram berhasil.\n\n"+
-			"Waktu server : %s\n"+
-			"Chat ID      : %s\n\n"+
+			"<b>Waktu server:</b> %s\n"+
+			"<b>Chat ID:</b> <code>%s</code>\n\n"+
 			"Pesan ini berasal dari tombol uji di halaman Pengaturan. "+
 			"Tidak ada perubahan file yang terkait dengan pesan ini.",
-		formatTimestamp(time.Now()), cleanText(chatID),
+		formatTimestamp(time.Now()), esc(chatID),
 	)
 	return t.sendMessage(msg)
 }
 
 // SendSystemAlert mengirim kegagalan operasional (mis. watch path hilang atau
-// tidak dapat diakses) yang membuat pemindaian tidak berjalan. Tanpa ini,
-// kegagalan hanya terlihat di log server dan admin tidak mendapat peringatan.
+// rantai ledger rusak) yang membuat pemindaian tidak berjalan atau bukti
+// tidak lagi dapat dipercaya. Tanpa ini, kegagalan hanya terlihat di log
+// server dan admin tidak mendapat peringatan.
 func (t *Telegram) SendSystemAlert(title, detail string) error {
 	if !t.IsConfigured() {
 		return fmt.Errorf("telegram token or chat_id not configured")
 	}
 
-	msg := fmt.Sprintf(
-		"FIM-IPL: %s\n\n"+
-			"Waktu   : %s\n"+
-			"Masalah : %s\n\n"+
-			"Tindakan:\n"+
-			"1. Pastikan watch path ada dan dapat dibaca oleh akun service FIM.\n"+
-			"2. Periksa izin folder serta ruang disk.\n"+
-			"3. Setelah diperbaiki, jalankan baseline ulang bila struktur file berubah.",
-		cleanText(title), formatTimestamp(time.Now()), cleanText(detail),
-	)
-	return t.sendMessage(msg)
+	var b strings.Builder
+	if title == "RANTAI LEDGER RUSAK" {
+		b.WriteString("🚨 <b>URGENT · FIM-IPL · Rantai Ledger Rusak</b>\n\n")
+	} else {
+		fmt.Fprintf(&b, "⚠️ <b>FIM-IPL · %s</b>\n\n", esc(title))
+	}
+	fmt.Fprintf(&b, "<b>Waktu:</b> %s\n", esc(formatTimestamp(time.Now())))
+	fmt.Fprintf(&b, "<b>Masalah:</b> %s\n", esc(detail))
+	if title == "RANTAI LEDGER RUSAK" {
+		b.WriteString("\n<b>Tindakan:</b>\n")
+		b.WriteString("1. Bandingkan head hash di pesan ini dengan head hash di dashboard. Bila berbeda, rantai di server sudah diubah.\n")
+		b.WriteString("2. Jangan jalankan baseline/update sebelum penyebabnya jelas.\n")
+		b.WriteString("3. Pulihkan ledger dari backup terakhir bila perlu, lalu audit akun dan log akses server.\n")
+	} else {
+		b.WriteString("\n<b>Tindakan:</b>\n")
+		b.WriteString("1. Pastikan watch path ada dan dapat dibaca oleh akun service FIM.\n")
+		b.WriteString("2. Periksa izin folder serta ruang disk.\n")
+		b.WriteString("3. Setelah diperbaiki, jalankan baseline ulang bila struktur file berubah.\n")
+	}
+	return t.sendMessage(b.String())
 }
 
 // Kebijakan retry untuk pesan teks. Hanya kegagalan sementara yang diulang
@@ -161,10 +176,31 @@ type sendRetryable struct {
 
 func (e *sendRetryable) Error() string { return e.err.Error() }
 
+// badRequestError menandai penolakan 400 dari Telegram — dipakai untuk memicu
+// pengiriman ulang sebagai teks biasa (tanpa parse_mode HTML).
+type badRequestError struct{ err error }
+
+func (e *badRequestError) Error() string { return e.err.Error() }
+
+// sendMessage mengirim pesan sebagai HTML; bila Telegram menolak formatnya
+// (400), pesan dikirim ulang sekali sebagai teks biasa agar tidak ada alert
+// yang hilang gara-gara format.
 func (t *Telegram) sendMessage(text string) error {
+	err := t.sendWithRetries(text, "HTML")
+	if err != nil {
+		var badReq *badRequestError
+		if errors.As(err, &badReq) {
+			log.Printf("[Telegram] Format HTML ditolak (%v); kirim ulang sebagai teks biasa", badReq.err)
+			return t.sendWithRetries(stripHTMLTags(text), "")
+		}
+	}
+	return err
+}
+
+func (t *Telegram) sendWithRetries(text, parseMode string) error {
 	var lastErr error
 	for attempt := 1; attempt <= sendMaxAttempts; attempt++ {
-		err := t.sendMessageOnce(text)
+		err := t.sendMessageOnce(text, parseMode)
 		if err == nil {
 			if attempt > 1 {
 				log.Printf("[Telegram] Pesan terkirim pada percobaan ke-%d", attempt)
@@ -190,12 +226,15 @@ func (t *Telegram) sendMessage(text string) error {
 	return lastErr
 }
 
-func (t *Telegram) sendMessageOnce(text string) error {
+func (t *Telegram) sendMessageOnce(text, parseMode string) error {
 	token, chatID := t.getCredentials()
 
 	params := url.Values{}
 	params.Set("chat_id", chatID)
 	params.Set("text", text)
+	if parseMode != "" {
+		params.Set("parse_mode", parseMode)
+	}
 	params.Set("disable_web_page_preview", "true")
 
 	endpoint := t.endpoint(token, "sendMessage")
@@ -210,6 +249,9 @@ func (t *Telegram) sendMessageOnce(text string) error {
 		apiErr := fmt.Errorf("telegram API error (status %d): %s", resp.StatusCode, redactToken(strings.TrimSpace(string(body)), token))
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 			return &sendRetryable{err: apiErr, retryAfter: parseRetryAfter(body)}
+		}
+		if resp.StatusCode == http.StatusBadRequest {
+			return &badRequestError{err: apiErr}
 		}
 		return apiErr
 	}
@@ -257,22 +299,21 @@ func (t *Telegram) SendQuarantineFailures(failures []QuarantineFailure) error {
 
 	var b strings.Builder
 	if len(failures) == 1 {
-		b.WriteString("FIM-IPL: KARANTINA GAGAL - TINDAKAN DIPERLUKAN\n\n")
-		fmt.Fprintf(&b, "Waktu  : %s\n", formatTimestamp(time.Now()))
-		fmt.Fprintf(&b, "File   : %s\n", cleanText(failures[0].FilePath))
-		fmt.Fprintf(&b, "Alasan : %s\n", cleanText(failures[0].Reason))
+		b.WriteString("❌ <b>FIM-IPL · Karantina Gagal · Tindakan Diperlukan</b>\n\n")
+		fmt.Fprintf(&b, "<b>Waktu:</b> %s\n", esc(formatTimestamp(time.Now())))
+		fmt.Fprintf(&b, "<b>File:</b> <code>%s</code>\n", esc(failures[0].FilePath))
+		fmt.Fprintf(&b, "<b>Alasan:</b> %s\n", esc(failures[0].Reason))
 	} else {
-		fmt.Fprintf(&b, "FIM-IPL: KARANTINA GAGAL PADA %d FILE\n\n", len(failures))
-		fmt.Fprintf(&b, "Waktu : %s\n\n", formatTimestamp(time.Now()))
-		b.WriteString("File yang gagal dinonaktifkan:\n")
+		fmt.Fprintf(&b, "❌ <b>FIM-IPL · Karantina Gagal pada %d File</b>\n\n", len(failures))
+		fmt.Fprintf(&b, "<b>Waktu:</b> %s\n\n", esc(formatTimestamp(time.Now())))
+		b.WriteString("<b>File yang gagal dinonaktifkan:</b>\n")
 		listed := 0
 		for _, failure := range failures {
 			if listed >= maxListedFiles {
 				break
 			}
 			listed++
-			fmt.Fprintf(&b, "%d. %s\n", listed, cleanText(failure.FilePath))
-			fmt.Fprintf(&b, "   Alasan: %s\n", cleanText(failure.Reason))
+			fmt.Fprintf(&b, "%d. <code>%s</code>\n   Alasan: %s\n", listed, esc(failure.FilePath), esc(failure.Reason))
 		}
 		if remaining := len(failures) - listed; remaining > 0 {
 			fmt.Fprintf(&b, "... dan %d file lainnya. Lihat Audit Trail untuk daftar lengkap.\n", remaining)
@@ -284,7 +325,7 @@ func (t *Telegram) SendQuarantineFailures(failures []QuarantineFailure) error {
 	} else {
 		b.WriteString("\nFile-file tersebut masih dapat diakses melalui web server.\n\n")
 	}
-	b.WriteString("Tindakan segera:\n")
+	b.WriteString("<b>Tindakan segera:</b>\n")
 	b.WriteString("1. Nonaktifkan akses ke file melalui firewall, WAF, atau pindahkan file secara manual.\n")
 	b.WriteString("2. Periksa isi file dan log akses web server.\n")
 	b.WriteString("3. Perbaiki izin folder, lalu jalankan karantina ulang.")
@@ -292,11 +333,24 @@ func (t *Telegram) SendQuarantineFailures(failures []QuarantineFailure) error {
 }
 
 // SendDocument mengirim file (byte slice) sebagai dokumen ke chat Telegram.
-// Digunakan oleh modul backup untuk mengirim export JSON ledger.
+// Digunakan oleh modul backup untuk mengirim export JSON ledger. Caption
+// dikirim sebagai HTML; bila ditolak (400), dikirim ulang sebagai teks biasa.
 func (t *Telegram) SendDocument(filename string, data []byte, caption string) error {
 	if !t.IsConfigured() {
 		return fmt.Errorf("telegram not configured")
 	}
+	if err := t.sendDocumentOnce(filename, data, caption, "HTML"); err != nil {
+		var badReq *badRequestError
+		if errors.As(err, &badReq) {
+			log.Printf("[Telegram] Caption HTML ditolak (%v); kirim ulang sebagai teks biasa", badReq.err)
+			return t.sendDocumentOnce(filename, data, stripHTMLTags(caption), "")
+		}
+		return err
+	}
+	return nil
+}
+
+func (t *Telegram) sendDocumentOnce(filename string, data []byte, caption, parseMode string) error {
 	token, chatID := t.getCredentials()
 
 	var buf bytes.Buffer
@@ -305,6 +359,9 @@ func (t *Telegram) SendDocument(filename string, data []byte, caption string) er
 	_ = mw.WriteField("chat_id", chatID)
 	if caption != "" {
 		_ = mw.WriteField("caption", caption)
+	}
+	if parseMode != "" {
+		_ = mw.WriteField("parse_mode", parseMode)
 	}
 
 	part, err := mw.CreateFormFile("document", filename)
@@ -332,7 +389,11 @@ func (t *Telegram) SendDocument(filename string, data []byte, caption string) er
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("telegram sendDocument status %d: %s", resp.StatusCode, redactToken(strings.TrimSpace(string(body)), token))
+		apiErr := fmt.Errorf("telegram sendDocument status %d: %s", resp.StatusCode, redactToken(strings.TrimSpace(string(body)), token))
+		if resp.StatusCode == http.StatusBadRequest {
+			return &badRequestError{err: apiErr}
+		}
+		return apiErr
 	}
 
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
@@ -352,38 +413,59 @@ func (t *Telegram) endpoint(token, method string) string {
 }
 
 // ---------------------------------------------------------------------------
-// Message formatting (plain text, Bahasa Indonesia, tanpa emoji)
+// Message formatting (HTML, Bahasa Indonesia, emoji secukupnya)
 // ---------------------------------------------------------------------------
+
+// esc membersihkan nilai dinamis (path, alasan, ID, hash) lalu meng-escape
+// HTML, sehingga karakter < > & dari nama file tidak bisa merusak format
+// pesan atau menyuntikkan tag.
+func esc(s string) string {
+	return html.EscapeString(cleanText(s))
+}
+
+// stripHTMLTags menghapus tag HTML dari pesan (untuk pengiriman ulang sebagai
+// teks biasa). Hanya tag yang dipakai formatter sendiri yang dihapus; nilai
+// dinamis sudah di-escape sehingga tidak ada tag lain di dalam pesan.
+var htmlTagReplacer = strings.NewReplacer(
+	"<b>", "", "</b>", "",
+	"<i>", "", "</i>", "",
+	"<code>", "", "</code>", "",
+)
+
+func stripHTMLTags(s string) string {
+	return htmlTagReplacer.Replace(s)
+}
 
 func formatAlertMessage(block *models.Block) string {
 	if block == nil {
-		return "FIM-IPL: PERUBAHAN FILE TERDETEKSI\n\nDetail anomali tidak tersedia."
+		return "🛡️ <b>FIM-IPL · Perubahan File Terdeteksi</b>\n\nDetail anomali tidak tersedia."
 	}
 
 	var b strings.Builder
 	if block.Action == models.ActionQuarantineBreach {
-		b.WriteString("FIM-IPL: URGENT - KARANTINA DIBATALKAN\n\n")
+		b.WriteString("🚨 <b>URGENT · FIM-IPL · Karantina Dibatalkan</b>\n\n")
+		fmt.Fprintf(&b, "<b>%s</b> · %s\n", esc(block.Action), esc(actionDesc(block.Action)))
 	} else {
-		b.WriteString("FIM-IPL: PERUBAHAN FILE TERDETEKSI\n\n")
+		b.WriteString("🛡️ <b>FIM-IPL · Perubahan File Terdeteksi</b>\n\n")
+		fmt.Fprintf(&b, "%s <b>%s</b> · %s\n", actionEmoji(block.Action), esc(block.Action), esc(actionDesc(block.Action)))
 	}
-	fmt.Fprintf(&b, "Block        : %s\n", cleanText(block.ID))
+	fmt.Fprintf(&b, "<b>Blok:</b> <code>%s</code>\n", esc(block.ID))
+	fmt.Fprintf(&b, "<b>Waktu:</b> %s\n", esc(formatTimestamp(block.Timestamp)))
+	fmt.Fprintf(&b, "<b>File:</b> <code>%s</code>\n", esc(block.FilePath))
+	fmt.Fprintf(&b, "<b>Status:</b> %s %s\n", quarantineEmoji(block), esc(quarantineStatus(block)))
+	fmt.Fprintf(&b, "<b>Hash sebelum:</b> <code>%s</code>\n", esc(truncateHash(block.OldHash)))
+	fmt.Fprintf(&b, "<b>Hash sesudah:</b> <code>%s</code>\n", esc(truncateHash(block.NewHash)))
+	if block.Action == models.ActionModeChanged || block.Action == models.ActionQuarantineBreach {
+		fmt.Fprintf(&b, "<b>Izin sebelum:</b> <code>%04o</code>\n", block.OldMode)
+		fmt.Fprintf(&b, "<b>Izin sesudah:</b> <code>%04o</code>\n", block.NewMode)
+	}
 	// Hash blok LENGKAP (T-06): jangkar eksternal. Bila rantai di server
 	// dipotong ekornya, head hash di Telegram tidak akan cocok dengan
 	// head hash rantai saat ini — itulah yang mendeteksi pemotongan yang
 	// tidak bisa dideteksi verifikasi lokal.
-	fmt.Fprintf(&b, "Block hash   : %s\n", cleanText(block.BlockHash))
-	fmt.Fprintf(&b, "Waktu        : %s\n", formatTimestamp(block.Timestamp))
-	fmt.Fprintf(&b, "Aksi         : %s\n", actionLabel(block.Action))
-	fmt.Fprintf(&b, "File         : %s\n", cleanText(block.FilePath))
-	fmt.Fprintf(&b, "Status file  : %s\n", quarantineStatus(block))
-	fmt.Fprintf(&b, "Hash sebelum : %s\n", truncateHash(block.OldHash))
-	fmt.Fprintf(&b, "Hash sesudah : %s\n", truncateHash(block.NewHash))
-	if block.Action == models.ActionModeChanged || block.Action == models.ActionQuarantineBreach {
-		fmt.Fprintf(&b, "Izin sebelum  : %04o\n", block.OldMode)
-		fmt.Fprintf(&b, "Izin sesudah  : %04o\n", block.NewMode)
-	}
+	fmt.Fprintf(&b, "🔗 <b>Block hash:</b> <code>%s</code>\n", esc(block.BlockHash))
 
-	b.WriteString("\nTindakan yang disarankan:\n")
+	b.WriteString("\n<b>Tindakan yang disarankan:</b>\n")
 	switch {
 	case block.Action == models.ActionQuarantineBreach:
 		b.WriteString("1. URGENT: file yang sudah dikarantina diaktifkan lagi oleh pemiliknya; sistem sudah mengarantina ulang secara otomatis.\n")
@@ -413,22 +495,19 @@ func formatBatchMessage(blocks []*models.Block, total int) string {
 	modified, created, deleted, unreadable := countActions(blocks)
 
 	var b strings.Builder
-	b.WriteString("FIM-IPL: RINGKASAN ANOMALI\n\n")
-	fmt.Fprintf(&b, "Waktu      : %s\n", formatTimestamp(time.Now()))
-	fmt.Fprintf(&b, "Total file : %d\n", total)
-	fmt.Fprintf(&b, "Modified   : %d\n", modified)
-	fmt.Fprintf(&b, "Created    : %d\n", created)
-	fmt.Fprintf(&b, "Deleted    : %d\n", deleted)
-	fmt.Fprintf(&b, "Unreadable : %d\n", unreadable)
+	b.WriteString("🛡️ <b>FIM-IPL · Ringkasan Anomali</b>\n\n")
+	fmt.Fprintf(&b, "<b>Waktu:</b> %s\n", esc(formatTimestamp(time.Now())))
+	fmt.Fprintf(&b, "<b>Total file:</b> %d\n", total)
+	fmt.Fprintf(&b, "<b>Rincian:</b> ✏️ %d diubah · 📄 %d baru · 🗑️ %d dihapus · ⚠️ %d tidak dapat dipindai\n", modified, created, deleted, unreadable)
 
-	b.WriteString("\nFile yang terdeteksi:\n")
+	b.WriteString("\n<b>File yang terdeteksi:</b>\n")
 	listed := 0
 	for _, block := range blocks {
 		if block == nil || listed >= maxListedFiles {
 			continue
 		}
 		listed++
-		fmt.Fprintf(&b, "%d. %s - %s (%s, hash %s)\n", listed, actionLabel(block.Action), cleanText(block.FilePath), cleanText(block.ID), truncateHash(block.BlockHash))
+		fmt.Fprintf(&b, "%d. %s <code>%s</code> · %s · <code>%s</code> · hash <code>%s</code>\n", listed, actionEmoji(block.Action), esc(block.FilePath), esc(block.Action), esc(block.ID), esc(truncateHash(block.BlockHash)))
 	}
 	if remaining := total - listed; remaining > 0 {
 		fmt.Fprintf(&b, "... dan %d file lainnya.\n", remaining)
@@ -437,7 +516,7 @@ func formatBatchMessage(blocks []*models.Block, total int) string {
 	// pemotongan ekor terdeteksi dari Telegram walau verifikasi lokal
 	// terhadap rantai yang terpotong tetap lolos.
 	if head := headBlock(blocks); head != nil {
-		fmt.Fprintf(&b, "\nBlock terakhir : %s\nHash rantai     : %s\n", cleanText(head.ID), cleanText(head.BlockHash))
+		fmt.Fprintf(&b, "\n🔗 <b>Block terakhir:</b> <code>%s</code>\n🔗 <b>Hash rantai:</b> <code>%s</code>\n", esc(head.ID), esc(head.BlockHash))
 	}
 
 	b.WriteString("\nDetail lengkap tersedia di dashboard, menu Audit Trail.")
@@ -448,24 +527,24 @@ func formatBulkWarningMessage(total int, blocks []*models.Block) string {
 	modified, created, deleted, unreadable := countActions(blocks)
 
 	var b strings.Builder
-	b.WriteString("FIM-IPL: PERUBAHAN MASSAL TERDETEKSI\n\n")
-	fmt.Fprintf(&b, "Waktu            : %s\n", formatTimestamp(time.Now()))
-	fmt.Fprintf(&b, "Jumlah perubahan : %d file\n", total)
+	b.WriteString("⚠️ <b>FIM-IPL · Perubahan Massal Terdeteksi</b>\n\n")
+	fmt.Fprintf(&b, "<b>Waktu:</b> %s\n", esc(formatTimestamp(time.Now())))
+	fmt.Fprintf(&b, "<b>Jumlah perubahan:</b> %d file\n", total)
 	if len(blocks) > 0 {
-		fmt.Fprintf(&b, "Rincian          : %d modified, %d created, %d deleted, %d unreadable\n", modified, created, deleted, unreadable)
+		fmt.Fprintf(&b, "<b>Rincian:</b> %d modified, %d created, %d deleted, %d unreadable\n", modified, created, deleted, unreadable)
 	}
 
-	b.WriteString("\nKemungkinan penyebab:\n")
-	b.WriteString("- Update CMS, plugin, atau tema WordPress\n")
-	b.WriteString("- Pemasangan atau penghapusan plugin\n")
-	b.WriteString("- Operasi massal oleh administrator\n")
+	b.WriteString("\n<b>Kemungkinan penyebab:</b>\n")
+	b.WriteString("• Update CMS, plugin, atau tema WordPress\n")
+	b.WriteString("• Pemasangan atau penghapusan plugin\n")
+	b.WriteString("• Operasi massal oleh administrator\n")
 
 	// Jangkar eksternal (T-06): lihat formatBatchMessage.
 	if head := headBlock(blocks); head != nil {
-		fmt.Fprintf(&b, "\nBlock terakhir : %s\nHash rantai     : %s\n", cleanText(head.ID), cleanText(head.BlockHash))
+		fmt.Fprintf(&b, "\n🔗 <b>Block terakhir:</b> <code>%s</code>\n🔗 <b>Hash rantai:</b> <code>%s</code>\n", esc(head.ID), esc(head.BlockHash))
 	}
 
-	b.WriteString("\nTindakan:\n")
+	b.WriteString("\n<b>Tindakan:</b>\n")
 	b.WriteString("1. Jika sedang melakukan update, aktifkan maintenance mode.\n")
 	b.WriteString("2. Jika tidak ada aktivitas admin, periksa dashboard dan log akses server.\n")
 	b.WriteString("3. Backup ledger otomatis dijalankan untuk anomali kritis.\n")
@@ -508,22 +587,64 @@ func countActions(blocks []*models.Block) (modified, created, deleted, unreadabl
 	return modified, created, deleted, unreadable
 }
 
-func actionLabel(action string) string {
+// actionEmoji adalah emoji penanda satu aksi: dipakai pada baris aksi alert
+// per-blok dan pada daftar file ringkasan. Satu emoji per aksi, tidak lebih.
+func actionEmoji(action string) string {
+	switch action {
+	case models.ActionCreated:
+		return "📄"
+	case models.ActionModified:
+		return "✏️"
+	case models.ActionDeleted:
+		return "🗑️"
+	case models.ActionModeChanged:
+		return "🔐"
+	case models.ActionUnreadable:
+		return "⚠️"
+	case models.ActionQuarantineBreach:
+		return "🚨"
+	case models.ActionReleased:
+		return "🔓"
+	default:
+		return "🔍"
+	}
+}
+
+// actionDesc adalah label Bahasa Indonesia untuk satu aksi (tanpa kode aksi).
+func actionDesc(action string) string {
 	switch action {
 	case models.ActionModified:
-		return "MODIFIED (isi file berubah)"
+		return "isi file berubah"
 	case models.ActionCreated:
-		return "CREATED (file baru)"
+		return "file baru"
 	case models.ActionDeleted:
-		return "DELETED (file dihapus)"
+		return "file dihapus"
+	case models.ActionModeChanged:
+		return "izin file berubah"
 	case models.ActionUnreadable:
-		return "UNREADABLE (file tidak dapat dipindai)"
+		return "file tidak dapat dipindai"
 	case models.ActionQuarantineBreach:
-		return "QUARANTINE_BREACH (karantina dibatalkan pemilik berkas)"
+		return "karantina dibatalkan pemilik berkas"
 	case models.ActionReleased:
-		return "RELEASED (karantina dilepas)"
+		return "karantina dilepas"
 	default:
 		return cleanText(action)
+	}
+}
+
+// quarantineEmoji menandai status karantina pada baris status alert per-blok.
+func quarantineEmoji(block *models.Block) string {
+	switch {
+	case block.Action == models.ActionDeleted:
+		return "🗑️"
+	case block.Action == models.ActionUnreadable:
+		return "⚠️"
+	case block.Quarantined:
+		return "🔒"
+	case block.QuarantineErr != "":
+		return "❌"
+	default:
+		return "➖"
 	}
 }
 

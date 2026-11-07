@@ -38,11 +38,11 @@ func TestFormatCaptionIncludesHeadAnchor(t *testing.T) {
 	caption := formatCaption("manual", "fim-ipl-ledger-manual-1.json", exp)
 
 	for _, want := range []string{
-		"FIM-IPL: BACKUP LEDGER",
-		"Jenis       : manual",
-		"Total blok  : 12",
-		"Verifikasi  : UTUH",
-		"Head hash   : " + strings.Repeat("f", 64),
+		"💾 <b>FIM-IPL · Backup Ledger</b>",
+		"<b>Jenis:</b> manual",
+		"<b>Total blok:</b> 12",
+		"✅ UTUH",
+		"<b>Head hash:</b> <code>" + strings.Repeat("f", 64) + "</code>",
 		"fim-ipl-ledger-manual-1.json",
 	} {
 		if !strings.Contains(caption, want) {

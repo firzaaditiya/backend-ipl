@@ -25,17 +25,17 @@ func testBlock(path, action string, quarantined bool) *models.Block {
 	}
 }
 
-func TestFormatAlertMessagePlainTextAndSanitized(t *testing.T) {
+func TestFormatAlertMessageHTMLAndSanitized(t *testing.T) {
 	block := testBlock("C:\\www\\site\\functions.php\nPesan palsu", models.ActionModified, true)
 
 	msg := formatAlertMessage(block)
 
 	for _, want := range []string{
-		"FIM-IPL: PERUBAHAN FILE TERDETEKSI",
-		"Block        : BLK-000001",
-		"MODIFIED (isi file berubah)",
+		"🛡️ <b>FIM-IPL · Perubahan File Terdeteksi</b>",
+		"<code>BLK-000001</code>",
+		"✏️ <b>MODIFIED</b> · isi file berubah",
 		"C:\\www\\site\\functions.php Pesan palsu",
-		"Berhasil dikarantina",
+		"🔒 Berhasil dikarantina",
 		"aaaaaaaa...aaaaaaaa",
 		"Tindakan yang disarankan:",
 	} {
@@ -46,9 +46,27 @@ func TestFormatAlertMessagePlainTextAndSanitized(t *testing.T) {
 	if strings.Contains(msg, "\nPesan palsu") {
 		t.Fatal("newline in file path must not create a new message line")
 	}
-	for _, r := range msg {
-		if r > 127 {
-			t.Fatalf("message must not contain emoji/non-ASCII characters: %q", msg)
+}
+
+// Nilai dinamis yang mengandung < > & harus di-escape agar tidak bisa
+// menyuntikkan tag HTML ke pesan.
+func TestFormatAlertMessageEscapesHTML(t *testing.T) {
+	block := testBlock("/var/www/<b>jahat</b>.php", models.ActionCreated, false)
+	block.QuarantineErr = "gagal: <script>alert(1)</script>"
+
+	msg := formatAlertMessage(block)
+
+	for _, want := range []string{
+		"&lt;b&gt;jahat&lt;/b&gt;",
+		"&lt;script&gt;alert(1)&lt;/script&gt;",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("message missing escaped %q:\n%s", want, msg)
+		}
+	}
+	for _, bad := range []string{"<b>jahat</b>", "<script>alert(1)</script>"} {
+		if strings.Contains(msg, bad) {
+			t.Fatalf("message must not contain raw HTML %q:\n%s", bad, msg)
 		}
 	}
 }
@@ -75,7 +93,7 @@ func TestFormatBatchMessageListsAtMostFiveFiles(t *testing.T) {
 
 	msg := formatBatchMessage(blocks, len(blocks))
 
-	if !strings.Contains(msg, "Total file : 7") {
+	if !strings.Contains(msg, "<b>Total file:</b> 7") {
 		t.Fatalf("missing total:\n%s", msg)
 	}
 	if !strings.Contains(msg, "... dan 2 file lainnya.") {
@@ -94,8 +112,8 @@ func TestFormatBulkWarningIncludesBreakdown(t *testing.T) {
 	msg := formatBulkWarningMessage(60, blocks)
 
 	for _, want := range []string{
-		"FIM-IPL: PERUBAHAN MASSAL TERDETEKSI",
-		"Jumlah perubahan : 60 file",
+		"FIM-IPL · Perubahan Massal Terdeteksi",
+		"<b>Jumlah perubahan:</b> 60 file",
 		"1 modified, 1 created, 1 deleted, 1 unreadable",
 		"Update CMS, plugin, atau tema WordPress",
 	} {
@@ -136,7 +154,7 @@ func TestSendQuarantineFailuresAggregates(t *testing.T) {
 		t.Fatal("expected one aggregated message, got none")
 	}
 	for _, want := range []string{
-		"KARANTINA GAGAL PADA 7 FILE",
+		"Karantina Gagal pada 7 File",
 		"/var/www/shella.php",
 		"... dan 2 file lainnya",
 		"Tindakan segera:",
@@ -147,20 +165,20 @@ func TestSendQuarantineFailuresAggregates(t *testing.T) {
 	}
 }
 
-func TestSendAlertSendsEveryTimeWithoutParseMode(t *testing.T) {
+func TestSendAlertSendsHTMLParseMode(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&calls, 1)
 		if err := r.ParseForm(); err != nil {
 			t.Errorf("ParseForm: %v", err)
 		}
-		if got := r.Form.Get("parse_mode"); got != "" {
-			t.Errorf("parse_mode must be empty, got %q", got)
+		if got := r.Form.Get("parse_mode"); got != "HTML" {
+			t.Errorf("parse_mode = %q, want HTML", got)
 		}
 		if got := r.Form.Get("disable_web_page_preview"); got != "true" {
 			t.Errorf("disable_web_page_preview = %q", got)
 		}
-		if !strings.Contains(r.Form.Get("text"), "PERUBAHAN FILE TERDETEKSI") {
+		if !strings.Contains(r.Form.Get("text"), "Perubahan File Terdeteksi") {
 			t.Errorf("unexpected message text: %q", r.Form.Get("text"))
 		}
 		w.WriteHeader(http.StatusOK)
@@ -207,10 +225,10 @@ func TestSendTestMessageContent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
 		text := r.Form.Get("text")
-		if !strings.Contains(text, "FIM-IPL: TES NOTIFIKASI") {
+		if !strings.Contains(text, "Tes Notifikasi") {
 			t.Errorf("unexpected test text: %q", text)
 		}
-		if !strings.Contains(text, "Chat ID      : 12345") {
+		if !strings.Contains(text, "Chat ID:</b> <code>12345</code>") {
 			t.Errorf("chat id missing from test text: %q", text)
 		}
 		w.WriteHeader(http.StatusOK)
@@ -238,7 +256,7 @@ func TestFormatUnreadableAlert(t *testing.T) {
 	msg := formatAlertMessage(block)
 
 	for _, want := range []string{
-		"UNREADABLE (file tidak dapat dipindai)",
+		"⚠️ <b>UNREADABLE</b> · file tidak dapat dipindai",
 		"Tidak dapat dipindai: pemindaian: permission denied",
 		"Periksa izin file/folder",
 	} {
@@ -265,7 +283,7 @@ func TestSendSystemAlert(t *testing.T) {
 
 	text, _ := got.Load().(string)
 	for _, want := range []string{
-		"FIM-IPL: PEMINDAIAN GAGAL",
+		"FIM-IPL · PEMINDAIAN GAGAL",
 		"watch path tidak ditemukan",
 		"Pastikan watch path ada",
 	} {
@@ -335,19 +353,14 @@ func TestFormatAlertMessageQuarantineBreachIsUrgent(t *testing.T) {
 	msg := formatAlertMessage(block)
 
 	for _, want := range []string{
-		"FIM-IPL: URGENT - KARANTINA DIBATALKAN",
-		"QUARANTINE_BREACH (karantina dibatalkan pemilik berkas)",
-		"Izin sebelum  : 0000",
-		"Izin sesudah  : 0644",
+		"🚨 <b>URGENT · FIM-IPL · Karantina Dibatalkan</b>",
+		"<b>QUARANTINE_BREACH</b> · karantina dibatalkan pemilik berkas",
+		"<b>Izin sebelum:</b> <code>0000</code>",
+		"<b>Izin sesudah:</b> <code>0644</code>",
 		"mengarantina ulang secara otomatis",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("message missing %q:\n%s", want, msg)
-		}
-	}
-	for _, r := range msg {
-		if r > 127 {
-			t.Fatalf("message must not contain emoji/non-ASCII characters: %q", msg)
 		}
 	}
 }
@@ -361,17 +374,11 @@ func TestFormatAlertMessageIncludesFullBlockHash(t *testing.T) {
 
 	msg := formatAlertMessage(block)
 
-	if !strings.Contains(msg, "Block        : BLK-000018") {
+	if !strings.Contains(msg, "<code>BLK-000018</code>") {
 		t.Fatalf("per-block alert must contain the block ID:\n%s", msg)
 	}
-	if !strings.Contains(msg, "Block hash   : "+strings.Repeat("d", 64)) {
+	if !strings.Contains(msg, "<b>Block hash:</b> <code>"+strings.Repeat("d", 64)+"</code>") {
 		t.Fatalf("per-block alert must contain the FULL block hash:\n%s", msg)
-	}
-	// ASCII saja (aturan yang sudah ada untuk semua pesan alert).
-	for _, r := range msg {
-		if r > 127 {
-			t.Fatalf("alert must be ASCII-only, found %q", r)
-		}
 	}
 }
 
@@ -393,15 +400,41 @@ func TestFormatBatchMessageIncludesBlockIDsAndHeadHash(t *testing.T) {
 			t.Fatalf("batch alert must list block ID %s:\n%s", id, msg)
 		}
 	}
-	if !strings.Contains(msg, "Block terakhir : BLK-000004") {
+	if !strings.Contains(msg, "<b>Block terakhir:</b> <code>BLK-000004</code>") {
 		t.Fatalf("batch alert must name the head block:\n%s", msg)
 	}
-	if !strings.Contains(msg, "Hash rantai     : "+strings.Repeat("d", 64)) {
+	if !strings.Contains(msg, "<b>Hash rantai:</b> <code>"+strings.Repeat("d", 64)+"</code>") {
 		t.Fatalf("batch alert must contain the FULL head hash:\n%s", msg)
 	}
 
 	bulk := formatBulkWarningMessage(60, blocks)
-	if !strings.Contains(bulk, "Block terakhir : BLK-000004") || !strings.Contains(bulk, strings.Repeat("d", 64)) {
+	if !strings.Contains(bulk, "<b>Block terakhir:</b> <code>BLK-000004</code>") || !strings.Contains(bulk, strings.Repeat("d", 64)) {
 		t.Fatalf("bulk alert must contain the head block ID and full head hash:\n%s", bulk)
+	}
+}
+
+// Bila Telegram menolak format HTML (400), pesan dikirim ulang sekali
+// sebagai teks biasa tanpa parse_mode dan tetap terkirim.
+func TestSendFallsBackToPlainTextOnBadRequest(t *testing.T) {
+	var modes []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		modes = append(modes, r.Form.Get("parse_mode"))
+		if r.Form.Get("parse_mode") == "HTML" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"ok":false,"description":"Bad Request: can't parse entities"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	tg := NewTelegram("test-token", "12345")
+	tg.apiBase = srv.URL
+	if err := tg.SendAlert(testBlock("/var/www/a.php", models.ActionModified, true)); err != nil {
+		t.Fatalf("SendAlert should succeed after plain-text fallback: %v", err)
+	}
+	if len(modes) != 2 || modes[0] != "HTML" || modes[1] != "" {
+		t.Fatalf("expected HTML attempt then plain-text retry, got %v", modes)
 	}
 }
